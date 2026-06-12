@@ -12,30 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset
 from typing import List
+
 
 # ---------------------------------------------------------------------------
 # Dummy dataset so the TRL training loop has something to iterate over
 # ---------------------------------------------------------------------------
 
-class _AtroposPlaceholderDataset(IterableDataset):
+class _AtroposPlaceholderDataset(Dataset):
     """
     Yields trivial placeholder dicts indefinitely.
 
     AtroposGRPOTrainer completely bypasses the HuggingFace dataset in
-    `_prepare_inputs`, fetching real batches from the Atropos API instead.
+    ``_prepare_inputs``, fetching real batches from the Atropos API instead.
     This dataset exists solely to satisfy the Trainer base-class contract
-    which requires a non-empty `train_dataset`.
+    which requires a non-empty ``train_dataset``.
     """
 
     def __init__(self, total_steps: int):
         self.total_steps = total_steps
+        self._data = [{"prompt": ""}] * total_steps
 
-    def __iter__(self):
-        for _ in range(self.total_steps):
-            yield {"prompt": ""}
-            
+    def __len__(self):
+        return self.total_steps
+
+    def __getitem__(self, idx):
+        return self._data[idx]
+
 
 # ---------------------------------------------------------------------------
 # Helper: pass-through reward function
