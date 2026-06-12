@@ -275,6 +275,27 @@ class AtroposGRPOTrainer(GRPOTrainer):
             total_steps = getattr(args, "max_steps", None) or 10_000
             train_dataset = _AtroposPlaceholderDataset(total_steps)
 
+        # Warn if the user has set multi_objective_aggregation or scale_rewards
+        # to non-default values, since AtroposGRPOTrainer hardcodes the GRPO
+        # advantage computation and those settings will have no effect.
+        if getattr(args, "multi_objective_aggregation", None) not in (None, "sum_then_normalize"):
+            logger.warning(
+                "AtroposGRPOTrainer: multi_objective_aggregation is set to '%s', but "
+                "the advantage computation in _convert_atropos_batch hardcodes "
+                "group-relative normalisation (equivalent to 'sum_then_normalize' "
+                "with scale_rewards='group').  The setting will be ignored. "
+                "Override _convert_atropos_batch for custom advantage aggregation.",
+                args.multi_objective_aggregation,
+            )
+        if getattr(args, "scale_rewards", None) not in (None, "group"):
+            logger.warning(
+                "AtroposGRPOTrainer: scale_rewards is set to '%s', but the advantage "
+                "computation in _convert_atropos_batch hardcodes group-relative "
+                "normalisation.  The setting will be ignored. "
+                "Override _convert_atropos_batch for custom scaling.",
+                args.scale_rewards,
+            )
+
         # ------------------------------------------------------------------ #
         # Delegate to GRPOTrainer.__init__ with use_vllm=True enforced.      #
         # The parent will create self.vllm_generation which we reuse for      #
@@ -419,9 +440,6 @@ class AtroposGRPOTrainer(GRPOTrainer):
             # For evaluation, use the standard TRL path.
             return super()._prepare_inputs(generation_batch)
 
-        # Lazy registration on first training step
-        self._ensure_registered()
-
         generate_every = self.args.steps_per_generation * self.num_iterations
         if self._step % generate_every == 0 or self._buffered_inputs is None:
             # ----------------------------------------------------------------
@@ -475,21 +493,6 @@ class AtroposGRPOTrainer(GRPOTrainer):
         time, since each process independently fetches batches from the
         API server).  The barrier ensures collective alignment.
         """
-        if not self.use_vllm:
-            logger.warning(
-                "AtroposGRPOTrainer: use_vllm=False – cannot sync weights to "
-                "the TRL vLLM server.  Atropos environments will use stale "
-                "weights.  Set use_vllm=True with vllm_mode='server'."
-            )
-            return
-
-        if not hasattr(self, "vllm_generation"):
-            logger.warning(
-                "AtroposGRPOTrainer: vllm_generation not initialised – "
-                "weight sync skipped.  This should not happen when use_vllm=True."
-            )
-            return
-
         if self.state.global_step != self._last_loaded_step:
             # Barrier to ensure all processes are at the same logical sync
             # boundary before calling the NCCL collective sync_weights().
@@ -664,8 +667,14 @@ class AtroposGRPOTrainer(GRPOTrainer):
             # Real log-probabilities are always negative (log of probability ≤ 1),
             # so a value == 0.0 is unambiguously a sentinel.
             raw_lps = logprobs[completion_start:]
+            # Replace sentinel 0.0 logprobs (meaning "not provided") with a very
+            # negative value so they do not bias the importance-sampling ratio.
+            # Real log-probabilities are always ≤ 0 (log of probability ≤ 1),
+            # so 0.0 is unambiguously a sentinel indicating the field was absent
+            # in the source data.  A value of -100.0 gives exp(-100) ≈ 3.7e-44,
+            # effectively zero weight in the importance-sampling ratio.
             completion_logps_list.append(
-                [lp if lp != 0.0 else 0.0 for lp in raw_lps]
+                [lp if lp != 0.0 else -100.0 for lp in raw_lps]
             )
 
             scores_list.append(float(traj["score"]))
@@ -752,28 +761,15 @@ class AtroposGRPOTrainer(GRPOTrainer):
             completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
 
         # ------------------------------------------------------------------ #
-        # Step 5 – reference model logprobs (beta > 0)                        #
+        # Step 5 – old_per_token_logps, ref_per_token_logps, &                #
+        #          importance_sampling_ratio in a single no_grad block         #
         # ------------------------------------------------------------------ #
-        ref_per_token_logps: Optional[torch.Tensor] = None
-        if self.beta != 0.0:
-            ref_per_token_logps = self._compute_ref_logps(
-                prompt_ids=prompt_ids,
-                prompt_mask=prompt_mask,
-                completion_ids=completion_ids_t,
-                completion_mask=completion_mask,
-            )
-
-        # ------------------------------------------------------------------ #
-        # Step 5b – old_per_token_logps & importance_sampling_ratio           #
-        #          (vLLM⇔PyTorch distribution mismatch correction)            #
-        # ------------------------------------------------------------------ #
-        # When use_vllm=True, the parent class always computes
-        # old_per_token_logps because the vLLM inference log-probs
-        # (sampling_per_token_logps) come from the vLLM backend while
-        # per_token_logps comes from the PyTorch training model.  These
-        # can differ significantly even at the same weight value due to
-        # different implementation details (e.g. temperature scaling,
-        # float precision, kernel differences).
+        # When use_vllm=True, the parent class computes old_per_token_logps
+        # because the vLLM inference log-probs (sampling_per_token_logps)
+        # come from the vLLM backend while per_token_logps comes from the
+        # PyTorch training model.  These can differ significantly even at
+        # the same weight value due to different implementation details
+        # (e.g. temperature scaling, float precision, kernel differences).
         #
         # We replicate that logic here so that the importance-sampling
         # correction in compute_loss works correctly.
@@ -781,14 +777,22 @@ class AtroposGRPOTrainer(GRPOTrainer):
         prompt_completion_ids = torch.cat([prompt_ids, completion_ids_t], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids_t.size(1)
-        batch_size = self.args.per_device_train_batch_size
 
         old_per_token_logps: Optional[torch.Tensor] = None
+        ref_per_token_logps: Optional[torch.Tensor] = None
         importance_sampling_ratio: Optional[torch.Tensor] = None
 
         generate_every = self.args.steps_per_generation * self.num_iterations
 
         with torch.no_grad():
+            # ---- ref_per_token_logps (KL penalty, beta > 0) ---- #
+            if self.beta != 0.0:
+                ref_per_token_logps = self._compute_ref_logps(
+                    prompt_ids=prompt_ids,
+                    prompt_mask=prompt_mask,
+                    completion_ids=completion_ids_t,
+                    completion_mask=completion_mask,
+                )
             # ---- old_per_token_logps (importance sampling correction) ---- #
             # Compute the PyTorch model's log-probs on the current weights
             # right after sync.  This gives us the "old" policy log-probs
@@ -806,7 +810,7 @@ class AtroposGRPOTrainer(GRPOTrainer):
                         prompt_completion_ids,
                         attention_mask,
                         logits_to_keep,
-                        batch_size,
+                        self.args.per_device_train_batch_size,
                     )
 
             # ---- vLLM importance sampling ratio ---- #
@@ -1030,7 +1034,13 @@ class AtroposGRPOTrainer(GRPOTrainer):
             self._atropos_args.atropos_api_url,
         )
         self._ensure_registered()
-        return super().train(*args, **kwargs)
+        try:
+            return super().train(*args, **kwargs)
+        finally:
+            # Notify the Atropos API server that training has finished so it
+            # can clean up any per-trainer state (e.g., queue, buffer, envs).
+            self._atropos_client.disconnect_trainer()
+            logger.info("Disconnected from Atropos API server.")
 
 
 # ---------------------------------------------------------------------------

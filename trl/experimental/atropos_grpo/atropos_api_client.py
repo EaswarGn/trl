@@ -162,3 +162,15 @@ class AtroposAPIClient:
             f"No batch available from Atropos API at {self.base_url} "
             f"within {self.timeout}s."
         )
+
+    def disconnect_trainer(self) -> None:
+        """
+        Notify the Atropos API server that this trainer is shutting down.
+
+        This is a best-effort call — exceptions are swallowed so that a
+        failure to disconnect does not interrupt the training shutdown flow.
+        """
+        try:
+            self._post("/disconnect-trainer", timeout=5.0)
+        except Exception:
+            pass
