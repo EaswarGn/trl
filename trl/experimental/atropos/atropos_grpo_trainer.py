@@ -17,7 +17,7 @@ AtroposGRPOTrainer
 ==================
 A subclass of TRL's GRPOTrainer that replaces the rollout-generation layer with
 Atropos as the trajectory source.  Any Atropos environment that implements the
-ManagedServer API (i.e. returns `tokens`, `masked_tokens`, and `logprobs` per
+ManagedServer API (i.e. returns `tokens`, `masks`, and `inference_logprobs` per
 trajectory node) can be used as a drop-in rollout provider for this trainer.
 
 Architecture
@@ -51,11 +51,10 @@ Data-flow overview
                               │  GET /batch
                    ┌──────────▼───────────────────────────┐
                    │  AtroposGRPOTrainer                   │
-                   │  1. _fetch_atropos_batch()            │
-                   │  2. _convert_atropos_batch() → tensors│
-                   │  3. compute_loss()  (from GRPOTrainer)│
-                   │  4. optimizer step (from GRPOTrainer) │
-                   │  5. vllm_generation.sync_weights()    │
+                   │  1. _convert_atropos_batch() → tensors│
+                   │  2. compute_loss()  (from GRPOTrainer)│
+                   │  3. optimizer step (from GRPOTrainer) │
+                   │  4. vllm_generation.sync_weights()    │
                    │     (pushes weights → TRL vLLM server)│
                    └──────────────────────────────────────┘
 
@@ -63,31 +62,32 @@ Training loop
 -------------
 1. `train()` is called as normal.
 2. Each `_prepare_inputs()` call *ignores* the HuggingFace dataset batch
-   and instead calls `_fetch_atropos_batch()` which polls the Atropos API
-   until a ready batch is available.
+   and instead polls the Atropos API until a ready batch is available.
 3. The fetched batch is converted to the same tensor dict that
    `_generate_and_score_completions` normally returns, so `compute_loss`
    and all downstream logging code are completely unmodified.
-4. Weight sync back to the TRL vLLM server is handled by the parent class's
-   existing `vllm_generation.sync_weights()` call inside
-   `_generate_and_score_completions`.  Because we bypass that method, we
-   call `sync_weights()` ourselves at the right moment in `_prepare_inputs`
-   (once per `generate_every` window, before the next Atropos fetch begins).
+4. Weight sync back to the TRL vLLM server is triggered inside our
+   ``_prepare_inputs`` override at exactly the same cadence that the
+   base class would sync (once per ``generate_every`` window).  The
+   parent's ``use_vllm=True`` + ``vllm_mode="server"`` wiring is reused
+   in full — we just call ``vllm_generation.sync_weights()`` ourselves
+   because we bypass ``_generate_and_score_completions``.
 
 Atropos batch contract (from /batch endpoint)
 ----------------------------------------------
-Each item in the list returned by the Atropos API is a dict with at least:
+The Atropos API returns a list of *group* dicts.  Each group dict contains
+multiple parallel sequences that form one prompt group.  The trainer flattens
+these groups into individual trajectories internally.
 
-  tokens        : list[int]   – full sequence (prompt + completion)
-  masked_tokens : list[int]   – -100 for prompt positions, token id for completion
-  logprobs      : list[float] – 1.0 for masked (prompt) positions,
-                                actual log-prob for each completion token
-  scores        : list[float] | float  – per-item reward from the environment
+Each group dict from the API contains:
+  tokens              : list[list[int]]   – full sequences (prompt + completion)
+  masks               : list[list[int]]   – -100 for prompt, token_id for completion
+  inference_logprobs  : list[list[float]] – log-probs for each completion token
+  scores              : list[float]       – reward per trajectory in the group
+  env_id              : int               – source environment id
 
-Optional fields forwarded to reward functions / logging:
-  finish_reason  : str
-  prompt_text    : str
-  completion_text: str
+Optional fields forwarded to logging:
+  messages            : list              – full message history from the env
 
 Advantages are computed by this trainer using group-relative normalisation
 (identical to the standard GRPO formula) so that reward normalisation is
@@ -147,6 +147,8 @@ Environment setup
 from __future__ import annotations
 
 import logging
+import os
+from collections import Counter
 from typing import Any, Dict, List, Optional, cast
 
 import torch
@@ -222,6 +224,15 @@ class AtroposGRPOTrainer(GRPOTrainer):
         # output is harmlessly overridden.
         if reward_funcs is None:
             reward_funcs = _atropos_passthrough_reward
+        elif reward_funcs is not _atropos_passthrough_reward:
+            logger.warning(
+                "AtroposGRPOTrainer: custom reward_funcs were provided, but when using "
+                "Atropos trajectory fetching, rewards are produced by the environment "
+                "and the advantages tensor injected by _convert_atropos_batch overrides "
+                "the base-class reward pipeline output.  Custom reward_funcs will be "
+                "applied during evaluation (which uses the in-process generation path) "
+                "but are effectively ignored during training."
+            )
 
         # Create a lightweight placeholder dataset when none is given.
         # _prepare_inputs ignores it completely.
@@ -282,7 +293,12 @@ class AtroposGRPOTrainer(GRPOTrainer):
     # ---------------------------------------------------------------------- #
 
     def _ensure_registered(self) -> None:
-        """Register with the Atropos API exactly once, on the first call."""
+        """
+        Register with the Atropos API exactly once, on the first call.
+
+        Sends the full Registration schema expected by the Atropos API
+        server, mapping trainer config fields to server-side keys.
+        """
         if self._atropos_registered:
             return
 
@@ -292,14 +308,25 @@ class AtroposGRPOTrainer(GRPOTrainer):
                 "Ensure `run-api` is running before starting the trainer."
             )
 
-        batch_size = (
+        total_batch_size = (
             self.args.per_device_train_batch_size
             * self.accelerator.num_processes
         )
-        info = self._atropos_client.register(
-            batch_size=batch_size,
-            group_size=self._atropos_group_size,
-        )
+
+        # Build the full Registration schema expected by the Atropos API server.
+        # This includes all required fields from server.py::Registration.
+        reg_payload: Dict[str, Any] = {
+            "wandb_group": os.path.basename(self.args.output_dir),
+            "wandb_project": "trl-atropos",
+            "batch_size": total_batch_size,
+            "max_token_len": getattr(self.args, "max_completion_length", 2048),
+            "checkpoint_dir": self.args.output_dir,
+            "save_checkpoint_interval": getattr(self.args, "save_steps", 500),
+            "starting_step": 0,
+            "num_steps": getattr(self.args, "max_steps", 1000),
+        }
+
+        info = self._atropos_client.register(**reg_payload)
         logger.info("Registered with Atropos API. Server info: %s", info)
         self._atropos_registered = True
 
@@ -380,8 +407,10 @@ class AtroposGRPOTrainer(GRPOTrainer):
         ``_generate_and_score_completions``, which is normally where the
         parent triggers the sync.
 
-        The ``_last_loaded_step`` guard (inherited from GRPOTrainer) ensures
-        we do not push redundant updates within the same global step.
+        Uses ``self._step`` (the per-micro-step counter) rather than
+        ``self.state.global_step`` because ``_prepare_inputs`` can be
+        called multiple times within a single global step (during gradient
+        accumulation).  This ensures the sync does not get skipped.
         """
         if not self.use_vllm:
             logger.warning(
@@ -398,18 +427,18 @@ class AtroposGRPOTrainer(GRPOTrainer):
             )
             return
 
-        if self.state.global_step != self._last_loaded_step:
+        if self._step != self._last_loaded_step:
             try:
                 self.vllm_generation.sync_weights()
-                self._last_loaded_step = self.state.global_step
+                self._last_loaded_step = self._step
                 logger.debug(
-                    "Synced weights to TRL vLLM server at global step %d",
-                    self.state.global_step,
+                    "Synced weights to TRL vLLM server at micro-step %d",
+                    self._step,
                 )
             except Exception as exc:
                 logger.warning(
                     "Weight sync to TRL vLLM server failed at step %d: %s",
-                    self.state.global_step,
+                    self._step,
                     exc,
                 )
 
@@ -421,66 +450,135 @@ class AtroposGRPOTrainer(GRPOTrainer):
         self, raw_batch: List[Dict[str, Any]]
     ) -> dict[str, torch.Tensor | Any]:
         """
-        Convert a list of Atropos trajectory dicts into the tensor dict
-        expected by ``compute_loss``.
+        Convert an Atropos batch (list of group dicts from the API server)
+        into the tensor dict expected by ``compute_loss``.
 
-        This produces the same output shape as
-        ``_generate_and_score_completions`` so that all downstream loss
-        computation, logging, and metric code is completely unmodified.
+        The Atropos API returns group-oriented data where each dict contains
+        parallel lists of sequences.  This method flattens the groups into
+        individual trajectories.
 
-        Atropos trajectory fields (from ManagedServer nodes)
-        -----------------------------------------------------
-        tokens        : list[int]   full sequence (prompt+completion)
-        masked_tokens : list[int]   -100 for prompt, token_id for completion
-        logprobs      : list[float] 1.0 for masked positions, log-prob for completion tokens
-        scores        : float | list[float]  environment reward(s)
+        Atropos API server fields (from _scored_data_to_dict in server.py)
+        -------------------------------------------------------------------
+        tokens              : list[list[int]]   – parallel sequences (prompt+completion)
+        masks               : list[list[int]]   – -100 for prompt, token_id for completion
+        inference_logprobs  : list[list[float]] – log-probs for completion tokens
+        scores              : list[float]       – reward per sequence in the group
+        env_id              : int               – source environment identifier
 
-        Optional / enrichment fields
-        -----------------------------
-        finish_reason  : str
-        prompt_text    : str  (for logging)
-        completion_text: str  (for logging)
+        This produces the same output shape as ``_generate_and_score_completions``
+        so all downstream loss computation, logging, and metric code is completely
+        unmodified.
         """
         device = self.accelerator.device
-        num_trajectories = len(raw_batch)
         group_size = self._atropos_group_size
+
+        # ------------------------------------------------------------------ #
+        # Step 0 – flatten group-oriented data into per-trajectory items      #
+        # ------------------------------------------------------------------ #
+        # Each item in raw_batch is a group dict from the API server.
+        # We flatten: for each group, zip the parallel lists to produce one
+        # record per trajectory.
+
+        trajectories: List[Dict[str, Any]] = []
+        env_id_counter: Counter = Counter()
+
+        for group_idx, group_item in enumerate(raw_batch):
+            # Extract fields with meaningful error messages.
+            try:
+                tokens_list: List[List[int]] = group_item["tokens"]
+                masks_list: List[List[int]] = group_item["masks"]
+            except KeyError as e:
+                raise KeyError(
+                    f"_convert_atropos_batch: missing field {e} in group item {group_idx}. "
+                    "The Atropos API server /batch endpoint must return dicts with "
+                    "'tokens' and 'masks' keys. See the Atropos batch contract in "
+                    "ATROPOS_GRPO_TRAINER.md."
+                ) from e
+
+            # inference_logprobs is optional in ScoredData; default to 1.0 sentinel.
+            logprobs_list: List[List[float]] = group_item.get(
+                "inference_logprobs",
+                [[1.0] * len(seq) for seq in tokens_list],
+            )
+
+            # scores is a list of floats, one per trajectory in the group.
+            scores_list: List[float] = group_item.get(
+                "scores",
+                [0.0] * len(tokens_list),
+            )
+
+            env_id = group_item.get("env_id")
+            env_id_counter[env_id] += len(tokens_list)
+
+            # Validate shapes within the group.
+            seq_count = len(tokens_list)
+            if not (len(masks_list) == seq_count and len(logprobs_list) == seq_count and len(scores_list) == seq_count):
+                raise ValueError(
+                    f"_convert_atropos_batch: group item {group_idx} has mismatched sequence counts: "
+                    f"tokens={seq_count}, masks={len(masks_list)}, "
+                    f"inference_logprobs={len(logprobs_list)}, scores={len(scores_list)}. "
+                    "All fields must contain the same number of trajectories."
+                )
+
+            for seq_idx in range(seq_count):
+                trajectories.append({
+                    "tokens": tokens_list[seq_idx],
+                    "masks": masks_list[seq_idx],
+                    "logprobs": logprobs_list[seq_idx],
+                    "score": scores_list[seq_idx],
+                })
+
+        # Log env_id distribution for multi-environment awareness.
+        if len(env_id_counter) > 1:
+            logger.info(
+                "Atropos batch contains trajectories from %d environments: %s",
+                len(env_id_counter),
+                dict(env_id_counter),
+            )
+
+        num_trajectories = len(trajectories)
+
+        if num_trajectories == 0:
+            raise ValueError(
+                "Atropos batch is empty after flattening. "
+                "The /batch endpoint returned group items, but none contained any sequences. "
+                "Please verify the Atropos environment is producing valid trajectory data."
+            )
 
         if num_trajectories % group_size != 0:
             raise ValueError(
                 f"Atropos batch size {num_trajectories} is not divisible by "
                 f"group_size {group_size}.  Ensure the Atropos environment "
-                "group_size matches atropos_group_size in AtroposGRPOConfig."
+                "group_size matches atropos_group_size in AtroposGRPOConfig. "
+                f"env_id distribution: {dict(env_id_counter)}"
             )
 
         # ------------------------------------------------------------------ #
         # Step 1 – split tokens into prompt / completion                       #
         # ------------------------------------------------------------------ #
-        # ManagedServer uses -100 in masked_tokens to mark prompt positions.
-        # We recover prompt_ids and completion_ids from that mask.
+        # The Atropos API server uses -100 in masks to mark prompt positions.
 
         prompt_ids_list: List[List[int]] = []
         completion_ids_list: List[List[int]] = []
         completion_logps_list: List[List[float]] = []
         scores_list: List[float] = []
-        prompt_texts: List[str] = []
-        completion_texts: List[str] = []
 
-        for item in raw_batch:
-            tokens: List[int] = item["tokens"]
-            masked: List[int] = item["masked_tokens"]
-            logprobs: List[float] = item["logprobs"]
+        for traj in trajectories:
+            tokens: List[int] = traj["tokens"]
+            masks: List[int] = traj["masks"]
+            logprobs: List[float] = traj["logprobs"]
 
-            if not (len(tokens) == len(masked) == len(logprobs)):
+            if not (len(tokens) == len(masks) == len(logprobs)):
                 raise ValueError(
-                    f"Atropos trajectory has mismatched lengths: "
-                    f"tokens={len(tokens)}, masked_tokens={len(masked)}, "
-                    f"logprobs={len(logprobs)}"
+                    f"_convert_atropos_batch: trajectory has mismatched lengths: "
+                    f"tokens={len(tokens)}, masks={len(masks)}, "
+                    f"logprobs={len(logprobs)}. "
+                    "All three fields must have the same length."
                 )
 
-            # Find where the completion begins: first position where
-            # masked_tokens != -100.
+            # Find where the completion begins: first position where masks != -100.
             completion_start = next(
-                (i for i, m in enumerate(masked) if m != -100),
+                (i for i, m in enumerate(masks) if m != -100),
                 len(tokens),
             )
 
@@ -495,15 +593,7 @@ class AtroposGRPOTrainer(GRPOTrainer):
                 [lp if lp != 1.0 else 0.0 for lp in raw_lps]
             )
 
-            # Normalise scores to a single float per trajectory
-            raw_score = item.get("scores", item.get("score", 0.0))
-            if isinstance(raw_score, (list, tuple)):
-                scores_list.append(float(sum(raw_score)))
-            else:
-                scores_list.append(float(raw_score))
-
-            prompt_texts.append(item.get("prompt_text", ""))
-            completion_texts.append(item.get("completion_text", ""))
+            scores_list.append(float(traj["score"]))
 
         # ------------------------------------------------------------------ #
         # Step 2 – GRPO advantage computation                                  #
@@ -601,16 +691,15 @@ class AtroposGRPOTrainer(GRPOTrainer):
         # ------------------------------------------------------------------ #
         # Step 6 – logging                                                     #
         # ------------------------------------------------------------------ #
-        self._logs["prompt"].extend(prompt_texts)
-        self._logs["completion"].extend(completion_texts)
-        self._logs["rewards"]["atropos_env"].extend(scores_list)
-        self._logs["advantages"].extend(advantages.tolist())
-
         # Completion length metrics (same keys as GRPOTrainer)
         completion_lengths = torch.tensor(
             [len(ids) for ids in completion_ids_list], dtype=torch.float32
         )
         self._metrics[mode]["completion_length"].append(completion_lengths.mean().item())
+
+        # Log rewards (use "atropos_env" as the reward source name)
+        self._logs["rewards"]["atropos_env"].extend(scores_list)
+        self._logs["advantages"].extend(advantages.tolist())
 
         # ------------------------------------------------------------------ #
         # Step 7 – assemble output dict (same shape as _generate_and_score)   #
@@ -647,6 +736,8 @@ class AtroposGRPOTrainer(GRPOTrainer):
         prompt_mask: torch.Tensor,
         completion_ids: torch.Tensor,
         completion_mask: torch.Tensor,
+        num_images: Optional[List[int]] = None,
+        **forward_kwargs,
     ) -> torch.Tensor:
         """
         Compute per-token log-probabilities under the reference model for
@@ -654,6 +745,15 @@ class AtroposGRPOTrainer(GRPOTrainer):
 
         Re-uses the parent class ``_get_per_token_logps_and_entropies``
         which correctly handles PEFT (adapter swap), DeepSpeed, and FSDP.
+
+        Args:
+            prompt_ids: Left-padded prompt token IDs.
+            prompt_mask: Left-padded prompt attention mask.
+            completion_ids: Right-padded completion token IDs.
+            completion_mask: Right-padded completion attention mask.
+            num_images: Number of images per sample (for VLM support).
+            **forward_kwargs: Additional keyword arguments forwarded to
+                the model forward pass (e.g. pixel_values, image_grid_thw).
         """
         from trl.models.utils import disable_gradient_checkpointing
 
@@ -672,6 +772,8 @@ class AtroposGRPOTrainer(GRPOTrainer):
                     attention_mask,
                     logits_to_keep,
                     batch_size,
+                    num_images=num_images,
+                    **forward_kwargs,
                 )
             else:
                 # PEFT path: temporarily disable the active adapter to get
@@ -692,6 +794,8 @@ class AtroposGRPOTrainer(GRPOTrainer):
                         attention_mask,
                         logits_to_keep,
                         batch_size,
+                        num_images=num_images,
+                        **forward_kwargs,
                     )
 
         return ref_logps

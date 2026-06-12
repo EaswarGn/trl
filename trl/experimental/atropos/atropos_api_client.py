@@ -95,25 +95,33 @@ class AtroposAPIClient:
         except Exception:
             return False
 
-    def register(self, batch_size: int, group_size: int) -> Dict[str, Any]:
+    def register(self, **registration_kwargs) -> Dict[str, Any]:
         """
         Register this trainer with the Atropos API.
 
-        Returns the server's registration acknowledgment dict which may
-        contain checkpoint step, wandb run info, etc.
+        Sends the full Registration schema expected by the Atropos API
+        server.  All keyword arguments are forwarded as JSON fields.
+
+        Typical fields expected by the server:
+            wandb_group           : str   – W&B group name
+            wandb_project         : str   – W&B project name
+            batch_size            : int   – total sequences per fetch
+            max_token_len         : int   – maximum token length
+            checkpoint_dir        : str   – path for checkpoints
+            save_checkpoint_interval : int – steps between checkpoints
+            starting_step         : int   – step to resume from
+            num_steps             : int   – total training steps
+
+        Returns the server's registration acknowledgment dict.
         """
-        payload = {
-            "trainer_id": self.trainer_id,
-            "batch_size": batch_size,
-            "group_size": group_size,
-        }
-        resp = self._post("/register", json=payload, timeout=30.0)
+        resp = self._post("/register", json=registration_kwargs, timeout=30.0)
         return resp.json()
 
     def fetch_batch(self) -> Optional[List[Dict[str, Any]]]:
         """
         Poll /batch once and return the payload list if a batch is ready.
-        Returns None if the server responded with 204 (no data yet).
+        Returns None if the server responded with 204 or the batch value is
+        falsy (None / empty list).
         """
         url = f"{self.base_url}/batch"
         resp = self._session.get(url, timeout=30.0)
@@ -121,9 +129,12 @@ class AtroposAPIClient:
             return None
         resp.raise_for_status()
         data = resp.json()
-        # The API may return {"batch": [...]} or a bare list
+        # The API returns {"batch": [...]} or {"batch": None}
         if isinstance(data, dict):
-            return data.get("batch") or data.get("data") or list(data.values())[0]
+            batch = data.get("batch")
+            if batch is None:
+                return None
+            return batch
         return data
 
     def wait_for_batch(self) -> List[Dict[str, Any]]:
