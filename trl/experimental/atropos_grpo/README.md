@@ -162,10 +162,13 @@ run-api
 One or more environment processes that generate and score trajectories. Each environment must be pointed at the TRL vLLM server.
 
 ```bash
-python environments/gsm8k_server.py serve \
+python environments/mcqa_thinking_env.py serve \
   --openai.model_name Qwen/Qwen2.5-1.5B-Instruct \
-  --openai.base_url http://localhost:8001/v1 \
-  --env.group_size 8 \
+  --openai.base_url http://localhost:8001 \
+  --openai.server_type trl \
+  --env.group_size 2 \
+  --env.batch_size 2 \
+  --env.tokenizer_name Qwen/Qwen2.5-1.5B-Instruct \
   --slurm false
 ```
 
