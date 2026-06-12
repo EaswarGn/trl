@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from .atropos_grpo_config import AtroposGRPOConfig
-from .atropos_grpo_trainer import AtroposGRPOTrainer
+from .atropos_grpo_trainer import AtroposGRPOTrainer, make_atropos_trainer
+from .atropos_api_client import AtroposAPIClient
 
-__all__ = ["AtroposGRPOConfig", "AtroposGRPOTrainer"]
+__all__ = ["AtroposGRPOConfig", "AtroposGRPOTrainer", "make_atropos_trainer", "AtroposAPIClient"]

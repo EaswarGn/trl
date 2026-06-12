@@ -224,7 +224,7 @@ class AtroposGRPOTrainer(GRPOTrainer):
         # output is harmlessly overridden.
         if reward_funcs is None:
             reward_funcs = _atropos_passthrough_reward
-        elif reward_funcs is not _atropos_passthrough_reward:
+        else:
             logger.warning(
                 "AtroposGRPOTrainer: custom reward_funcs were provided, but when using "
                 "Atropos trajectory fetching, rewards are produced by the environment "
@@ -298,6 +298,12 @@ class AtroposGRPOTrainer(GRPOTrainer):
 
         Sends the full Registration schema expected by the Atropos API
         server, mapping trainer config fields to server-side keys.
+
+        IMPORTANT: batch_size is per-device only (not multiplied by num_processes).
+        Each process independently fetches its own batch from the API server.
+        This ensures each GPU gets ``per_device_train_batch_size × group_size``
+        trajectories per generation window, which keeps group-relative advantage
+        normalisation correct on each process.
         """
         if self._atropos_registered:
             return
@@ -308,21 +314,19 @@ class AtroposGRPOTrainer(GRPOTrainer):
                 "Ensure `run-api` is running before starting the trainer."
             )
 
-        total_batch_size = (
-            self.args.per_device_train_batch_size
-            * self.accelerator.num_processes
-        )
-
         # Build the full Registration schema expected by the Atropos API server.
         # This includes all required fields from server.py::Registration.
         reg_payload: Dict[str, Any] = {
             "wandb_group": os.path.basename(self.args.output_dir),
             "wandb_project": "trl-atropos",
-            "batch_size": total_batch_size,
+            # Each process fetches its own batch; batch_size = per-device * group_size
+            # so that each process gets exactly the right number of trajectories
+            # for one generation window.
+            "batch_size": self.args.per_device_train_batch_size * self._atropos_group_size,
             "max_token_len": getattr(self.args, "max_completion_length", 2048),
             "checkpoint_dir": self.args.output_dir,
             "save_checkpoint_interval": getattr(self.args, "save_steps", 500),
-            "starting_step": 0,
+            "starting_step": self.state.global_step,
             "num_steps": getattr(self.args, "max_steps", 1000),
         }
 
@@ -407,10 +411,9 @@ class AtroposGRPOTrainer(GRPOTrainer):
         ``_generate_and_score_completions``, which is normally where the
         parent triggers the sync.
 
-        Uses ``self._step`` (the per-micro-step counter) rather than
-        ``self.state.global_step`` because ``_prepare_inputs`` can be
-        called multiple times within a single global step (during gradient
-        accumulation).  This ensures the sync does not get skipped.
+        Uses ``self.state.global_step`` (which tracks optimizer steps) rather
+        than ``self._step`` (the per-micro-step counter) for the sync guard,
+        matching the parent class's behaviour.
         """
         if not self.use_vllm:
             logger.warning(
@@ -427,18 +430,18 @@ class AtroposGRPOTrainer(GRPOTrainer):
             )
             return
 
-        if self._step != self._last_loaded_step:
+        if self.state.global_step != self._last_loaded_step:
             try:
                 self.vllm_generation.sync_weights()
-                self._last_loaded_step = self._step
+                self._last_loaded_step = self.state.global_step
                 logger.debug(
-                    "Synced weights to TRL vLLM server at micro-step %d",
-                    self._step,
+                    "Synced weights to TRL vLLM server at step %d",
+                    self.state.global_step,
                 )
             except Exception as exc:
                 logger.warning(
                     "Weight sync to TRL vLLM server failed at step %d: %s",
-                    self._step,
+                    self.state.global_step,
                     exc,
                 )
 
@@ -689,6 +692,89 @@ class AtroposGRPOTrainer(GRPOTrainer):
             )
 
         # ------------------------------------------------------------------ #
+        # Step 5b – old_per_token_logps & importance_sampling_ratio           #
+        #          (vLLM⇔PyTorch distribution mismatch correction)            #
+        # ------------------------------------------------------------------ #
+        # When use_vllm=True, the parent class always computes
+        # old_per_token_logps because the vLLM inference log-probs
+        # (sampling_per_token_logps) come from the vLLM backend while
+        # per_token_logps comes from the PyTorch training model.  These
+        # can differ significantly even at the same weight value due to
+        # different implementation details (e.g. temperature scaling,
+        # float precision, kernel differences).
+        #
+        # We replicate that logic here so that the importance-sampling
+        # correction in compute_loss works correctly.
+
+        prompt_completion_ids = torch.cat([prompt_ids, completion_ids_t], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids_t.size(1)
+        batch_size = self.args.per_device_train_batch_size
+
+        old_per_token_logps: Optional[torch.Tensor] = None
+        importance_sampling_ratio: Optional[torch.Tensor] = None
+
+        generate_every = self.args.steps_per_generation * self.num_iterations
+
+        with torch.no_grad():
+            # ---- old_per_token_logps (importance sampling correction) ---- #
+            # Compute the PyTorch model's log-probs on the current weights
+            # right after sync.  This gives us the "old" policy log-probs
+            # for the importance-sampling ratio in compute_loss.
+            if (
+                self.args.gradient_accumulation_steps % generate_every != 0
+                or (self.use_vllm and self.vllm_importance_sampling_correction)
+            ):
+                from trl.models.utils import disable_gradient_checkpointing
+                with disable_gradient_checkpointing(
+                    self.model, self.args.gradient_checkpointing_kwargs
+                ):
+                    old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.model,
+                        prompt_completion_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size,
+                    )
+
+            # ---- vLLM importance sampling ratio ---- #
+            if self.use_vllm and self.vllm_importance_sampling_correction:
+                mask = completion_mask
+
+                per_token_logps_diff = (old_per_token_logps - sampling_per_token_logps) * mask
+
+                sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
+                if sequence_level_is:
+                    per_sequence_logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
+                    logps_diff = per_sequence_logps_diff
+                else:
+                    logps_diff = per_token_logps_diff
+
+                is_ratio = torch.exp(logps_diff)
+
+                if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
+                    is_ratio = torch.clamp(
+                        is_ratio,
+                        min=self.vllm_importance_sampling_clip_min,
+                        max=self.vllm_importance_sampling_clip_max,
+                    )
+                elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
+                    min_val = (
+                        self.vllm_importance_sampling_clip_min
+                        if self.vllm_importance_sampling_clip_min is not None
+                        else -float("inf")
+                    )
+                    max_val = (
+                        self.vllm_importance_sampling_clip_max
+                        if self.vllm_importance_sampling_clip_max is not None
+                        else float("inf")
+                    )
+                    invalid_mis_mask = (is_ratio < min_val) | (is_ratio > max_val)
+                    is_ratio = is_ratio.masked_fill(invalid_mis_mask, value=0.0)
+
+                importance_sampling_ratio = is_ratio
+
+        # ------------------------------------------------------------------ #
         # Step 6 – logging                                                     #
         # ------------------------------------------------------------------ #
         # Completion length metrics (same keys as GRPOTrainer)
@@ -706,7 +792,14 @@ class AtroposGRPOTrainer(GRPOTrainer):
         # ------------------------------------------------------------------ #
         # num_items_in_batch is used by DAPO / VESPO normalisation.
         # For other loss types it is unused but must be present.
-        num_items_in_batch = int(completion_mask.sum().item())
+        # Gather the global count across all processes so loss scaling is
+        # consistent in distributed training.
+        local_num_items = int(completion_mask.sum().item())
+        num_items_in_batch = int(
+            self.accelerator.gather(
+                torch.tensor(local_num_items, device=device)
+            ).sum().item()
+        )
 
         output: dict[str, Any] = {
             "prompt_ids": prompt_ids,
@@ -722,6 +815,12 @@ class AtroposGRPOTrainer(GRPOTrainer):
 
         if ref_per_token_logps is not None:
             output["ref_per_token_logps"] = ref_per_token_logps
+
+        if old_per_token_logps is not None:
+            output["old_per_token_logps"] = old_per_token_logps
+
+        if importance_sampling_ratio is not None:
+            output["importance_sampling_ratio"] = importance_sampling_ratio
 
         return output
 
@@ -853,7 +952,7 @@ class AtroposGRPOTrainer(GRPOTrainer):
             self._atropos_args.atropos_api_url,
         )
         self._ensure_registered()
-        return super(GRPOTrainer, self).train(*args, **kwargs)
+        return super().train(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------

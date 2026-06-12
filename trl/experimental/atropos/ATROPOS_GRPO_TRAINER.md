@@ -350,12 +350,12 @@ trainer.train()
 
 The Atropos API's `/batch` endpoint returns a list of trajectory dicts. Each dict must contain:
 
-| Field             | Type                        | Description                                                                                                                                                                                                           |
-| ----------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tokens`        | `list[int]`               | Full token sequence: prompt tokens followed by completion tokens.                                                                                                                                                     |
-| `masked_tokens` | `list[int]`               | `-100`for each prompt position; the actual token ID at each completion position. Used to recover the prompt/completion boundary.                                                                                    |
-| `logprobs`      | `list[float]`             | `1.0`(sentinel) for each prompt position; the actual log-probability at each completion token position. Must be the log-prob of the**sampled**token under the policy that generated it (the TRL vLLM server). |
-| `scores`        | `float`or `list[float]` | The environment's reward for this trajectory. If a list, values are summed to a single float.                                                                                                                         |
+| Field                    | Type                        | Description                                                                                                                                                                                                                     |
+| ------------------------ | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tokens`               | `list[int]`               | Full token sequence: prompt tokens followed by completion tokens.                                                                                                                                                               |
+| `masks`                | `list[int]`               | `-100`for each prompt position; the actual token ID at each completion position. Used to recover the prompt/completion boundary. Matches the `masks`field from the server's `ScoredData`model.                              |
+| `inference_logprobs`   | `list[float]`             | `1.0`(sentinel) for each prompt position; the actual log-probability at each completion token position. Must be the log-prob of the**sampled**token under the policy that generated it (the TRL vLLM server). |
+| `scores`               | `float`or `list[float]` | The environment's reward for this trajectory. If a list, values are summed to a single float.                                                                                                                                   |
 
 The following fields are optional but used for logging:
 
@@ -371,9 +371,9 @@ The following fields are optional but used for logging:
 
 ```python
 {
-    "tokens":        [10, 20, 30, 40, 50, 60, 1],   # 3 prompt + 4 completion tokens
-    "masked_tokens": [-100, -100, -100, 40, 50, 60, 1],
-    "logprobs":      [1.0, 1.0, 1.0, -0.3, -1.2, -0.8, -0.05],
+    "tokens":              [10, 20, 30, 40, 50, 60, 1],   # 3 prompt + 4 completion tokens
+    "masks":               [-100, -100, -100, 40, 50, 60, 1],
+    "inference_logprobs":  [1.0, 1.0, 1.0, -0.3, -1.2, -0.8, -0.05],
     "scores":        1.0,
     "prompt_text":   "What is 2 + 2?",
     "completion_text": "4",
