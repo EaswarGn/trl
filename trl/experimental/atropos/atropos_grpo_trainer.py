@@ -1,0 +1,829 @@
+# Copyright 2020-2026 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+AtroposGRPOTrainer
+==================
+A subclass of TRL's GRPOTrainer that replaces the rollout-generation layer with
+Atropos as the trajectory source.  Any Atropos environment that implements the
+ManagedServer API (i.e. returns `tokens`, `masked_tokens`, and `logprobs` per
+trajectory node) can be used as a drop-in rollout provider for this trainer.
+
+Architecture
+------------
+This trainer uses the TRL vLLM server (started by `trl vllm-serve`) as the
+sole vLLM backend.
+
+The Atropos environment microservices are configured to call the same TRL
+vLLM server (`--openai.base_url http://<host>:<port>/v1`) for generation.
+The trainer owns the vLLM server's weights via TRL's native
+`VLLMGeneration.sync_weights()` mechanism.
+
+Data-flow overview
+------------------
+                   ┌──────────────────────────────────────┐
+                   │  TRL vLLM server (trl vllm-serve)    │
+                   │  :8001  (started automatically or    │
+                   │  pointed to via vllm_server_*)        │
+                   └──────────┬───────────────────────────┘
+                              │  OpenAI-compatible /v1 API
+                   ┌──────────▼───────────────────────────┐
+                   │  Atropos env microservice(s)          │
+                   │  • generates completions via TRL vLLM │
+                   │  • scores trajectories                │
+                   │  • POST /scored_data to Atropos API   │
+                   └──────────┬───────────────────────────┘
+                              │  POST /scored_data
+                   ┌──────────▼───────────────────────────┐
+                   │  Atropos API server  (:8000)          │
+                   └──────────┬───────────────────────────┘
+                              │  GET /batch
+                   ┌──────────▼───────────────────────────┐
+                   │  AtroposGRPOTrainer                   │
+                   │  1. _fetch_atropos_batch()            │
+                   │  2. _convert_atropos_batch() → tensors│
+                   │  3. compute_loss()  (from GRPOTrainer)│
+                   │  4. optimizer step (from GRPOTrainer) │
+                   │  5. vllm_generation.sync_weights()    │
+                   │     (pushes weights → TRL vLLM server)│
+                   └──────────────────────────────────────┘
+
+Training loop
+-------------
+1. `train()` is called as normal.
+2. Each `_prepare_inputs()` call *ignores* the HuggingFace dataset batch
+   and instead calls `_fetch_atropos_batch()` which polls the Atropos API
+   until a ready batch is available.
+3. The fetched batch is converted to the same tensor dict that
+   `_generate_and_score_completions` normally returns, so `compute_loss`
+   and all downstream logging code are completely unmodified.
+4. Weight sync back to the TRL vLLM server is handled by the parent class's
+   existing `vllm_generation.sync_weights()` call inside
+   `_generate_and_score_completions`.  Because we bypass that method, we
+   call `sync_weights()` ourselves at the right moment in `_prepare_inputs`
+   (once per `generate_every` window, before the next Atropos fetch begins).
+
+Atropos batch contract (from /batch endpoint)
+----------------------------------------------
+Each item in the list returned by the Atropos API is a dict with at least:
+
+  tokens        : list[int]   – full sequence (prompt + completion)
+  masked_tokens : list[int]   – -100 for prompt positions, token id for completion
+  logprobs      : list[float] – 1.0 for masked (prompt) positions,
+                                actual log-prob for each completion token
+  scores        : list[float] | float  – per-item reward from the environment
+
+Optional fields forwarded to reward functions / logging:
+  finish_reason  : str
+  prompt_text    : str
+  completion_text: str
+
+Advantages are computed by this trainer using group-relative normalisation
+(identical to the standard GRPO formula) so that reward normalisation is
+always consistent regardless of the environment.
+
+Usage
+-----
+.. code-block:: python
+
+    from atropos_grpo_trainer import AtroposGRPOTrainer, AtroposGRPOConfig
+
+    config = AtroposGRPOConfig(
+        output_dir="./my_run",
+        per_device_train_batch_size=4,
+        num_generations=8,
+        # TRL vLLM server settings (same server the Atropos env will call)
+        use_vllm=True,
+        vllm_mode="server",
+        vllm_server_host="0.0.0.0",
+        vllm_server_port=8001,
+        # Atropos API settings
+        atropos_api_url="http://localhost:8000",
+        atropos_group_size=8,
+        max_steps=1000,
+    )
+
+    trainer = AtroposGRPOTrainer(
+        model="Qwen/Qwen2.5-1.5B-Instruct",
+        args=config,
+    )
+    trainer.train()
+
+Environment setup
+-----------------
+1. Start the TRL vLLM server (it serves *both* the trainer weight-sync
+   and the Atropos environments):
+
+    trl vllm-serve --model Qwen/Qwen2.5-1.5B-Instruct --port 8001
+
+2. Start the Atropos API server:
+
+    run-api   # default :8000
+
+3. Start one or more Atropos environments pointed at the TRL vLLM server:
+
+    python environments/gsm8k_server.py serve \\
+        --openai.model_name Qwen/Qwen2.5-1.5B-Instruct \\
+        --openai.base_url http://localhost:8001/v1 \\
+        --env.group_size 8 \\
+        --slurm false
+
+4. Start the trainer (use_vllm=True, vllm_mode="server"):
+
+    python train_atropos.py
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional, cast
+
+import torch
+from torch.utils.data import DataLoader
+
+from trl.trainer import GRPOTrainer
+from .atropos_grpo_config import AtroposGRPOConfig
+from .atropos_api_client import AtroposAPIClient
+from .placeholders import _AtroposPlaceholderDataset, _atropos_passthrough_reward
+from trl.trainer.utils import pad
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Main trainer
+# ---------------------------------------------------------------------------
+
+class AtroposGRPOTrainer(GRPOTrainer):
+    """
+    GRPOTrainer subclass that sources rollouts from an Atropos RL environment
+    rather than generating them in-process.
+
+    Key differences from the base GRPOTrainer
+    ------------------------------------------
+    * ``_prepare_inputs`` is overridden to fetch pre-scored trajectories
+      from the Atropos API server instead of calling
+      ``_generate_and_score_completions``.
+    * Advantage computation uses the same group-relative GRPO normalisation
+      so that all downstream loss code (``compute_loss``) is unchanged.
+    * Weight sync back to the TRL vLLM server is triggered inside our
+      ``_prepare_inputs`` override at exactly the same cadence that the
+      base class would sync (once per ``generate_every`` window).  The
+      parent's ``use_vllm=True`` + ``vllm_mode="server"`` wiring is reused
+      in full — we just call ``vllm_generation.sync_weights()`` ourselves
+      because we bypass ``_generate_and_score_completions``.
+    * ``training_step``, ``compute_loss``, logging, and all other parent
+      functionality are completely unmodified.
+    * ``train_dataset`` is optional: if ``None`` is provided a lightweight
+      placeholder iterator is created automatically.
+    """
+
+    def __init__(
+        self,
+        model,
+        args: Optional[AtroposGRPOConfig] = None,
+        reward_funcs=None,
+        train_dataset=None,
+        eval_dataset=None,
+        **kwargs,
+    ):
+        # ------------------------------------------------------------------ #
+        # Validate / create config                                             #
+        # ------------------------------------------------------------------ #
+        if args is None:
+            model_name = model if isinstance(model, str) else model.config._name_or_path
+            args = AtroposGRPOConfig(
+                output_dir=f"{model_name.split('/')[-1]}-atropos-grpo"
+            )
+
+        if not isinstance(args, AtroposGRPOConfig):
+            raise TypeError(
+                "AtroposGRPOTrainer requires an AtroposGRPOConfig instance, "
+                f"got {type(args).__name__}. Either use AtroposGRPOConfig directly "
+                "or promote your GRPOConfig: "
+                "AtroposGRPOConfig(**dataclasses.asdict(your_config))"
+            )
+
+        # Atropos provides rewards; a no-op pass-through reward_func satisfies
+        # the TRL base-class requirement without interfering with Atropos scores.
+        # The advantages tensor we inject in _convert_atropos_batch already
+        # contains the normalised rewards, so the base-class reward pipeline
+        # output is harmlessly overridden.
+        if reward_funcs is None:
+            reward_funcs = _atropos_passthrough_reward
+
+        # Create a lightweight placeholder dataset when none is given.
+        # _prepare_inputs ignores it completely.
+        if train_dataset is None:
+            total_steps = getattr(args, "max_steps", None) or 10_000
+            train_dataset = _AtroposPlaceholderDataset(total_steps)
+
+        # ------------------------------------------------------------------ #
+        # Delegate to GRPOTrainer.__init__ with use_vllm=True enforced.      #
+        # The parent will create self.vllm_generation which we reuse for      #
+        # sync_weights() after each training window.                          #
+        # ------------------------------------------------------------------ #
+        if not args.use_vllm:
+            logger.warning(
+                "AtroposGRPOTrainer: use_vllm is False but Atropos environments "
+                "need a running TRL vLLM server.  Forcing use_vllm=True.  "
+                "Set vllm_mode='server' and point vllm_server_host/port at the "
+                "server started by `trl vllm-serve`."
+            )
+            args.use_vllm = True
+
+        super().__init__(
+            model=model,
+            args=args,
+            reward_funcs=reward_funcs,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            **kwargs,
+        )
+
+        # Narrow the type of self.args for PyLance: the parent class types it as
+        # TrainingArguments, but we know it's AtroposGRPOConfig (which inherits
+        # steps_per_generation from GRPOConfig).
+        self.args = cast(AtroposGRPOConfig, self.args)
+
+        # ------------------------------------------------------------------ #
+        # Atropos API client                                                   #
+        # ------------------------------------------------------------------ #
+        self._atropos_args: AtroposGRPOConfig = args
+        self._atropos_client = AtroposAPIClient(
+            base_url=args.atropos_api_url,
+            trainer_id=args.atropos_trainer_id,
+            timeout=args.atropos_batch_timeout,
+            poll_interval=args.atropos_poll_interval,
+            max_retries=args.atropos_max_retries,
+        )
+
+        # ------------------------------------------------------------------ #
+        # State                                                                #
+        # ------------------------------------------------------------------ #
+        self._atropos_registered: bool = False
+        self._atropos_group_size: int = args.atropos_group_size
+        # Cache the last fetched raw batch for potential debugging / logging
+        self._last_raw_batch: Optional[List[Dict[str, Any]]] = None
+
+    # ---------------------------------------------------------------------- #
+    # Registration                                                             #
+    # ---------------------------------------------------------------------- #
+
+    def _ensure_registered(self) -> None:
+        """Register with the Atropos API exactly once, on the first call."""
+        if self._atropos_registered:
+            return
+
+        if not self._atropos_client.health():
+            raise ConnectionError(
+                f"Cannot reach Atropos API at {self._atropos_args.atropos_api_url}. "
+                "Ensure `run-api` is running before starting the trainer."
+            )
+
+        batch_size = (
+            self.args.per_device_train_batch_size
+            * self.accelerator.num_processes
+        )
+        info = self._atropos_client.register(
+            batch_size=batch_size,
+            group_size=self._atropos_group_size,
+        )
+        logger.info("Registered with Atropos API. Server info: %s", info)
+        self._atropos_registered = True
+
+    # ---------------------------------------------------------------------- #
+    # Core override: replace in-process rollout with Atropos batch fetch      #
+    # ---------------------------------------------------------------------- #
+
+    def _prepare_inputs(
+        self, generation_batch: dict[str, torch.Tensor | Any]
+    ) -> dict[str, torch.Tensor | Any]:
+        """
+        Override the base class _prepare_inputs to fetch trajectories from
+        Atropos instead of generating them in-process.
+
+        During training we:
+          1. Ensure we're registered with the Atropos API server.
+          2. When it is time to fetch a new window
+             (every ``steps_per_generation * num_iterations`` micro-steps):
+             a. Sync current model weights to the TRL vLLM server so the
+                Atropos environments pick up the latest policy.
+             b. Poll /batch until a scored batch is available.
+             c. Convert the Atropos payload to the tensor dict expected by
+                ``compute_loss``.
+             d. Split and buffer the result identically to the base class so
+                that ``steps_per_generation`` and ``num_iterations`` mechanics
+                work unchanged.
+          3. Return the correct slice for the current micro-step.
+
+        During evaluation we fall back to the standard in-process path
+        (calling ``super()._prepare_inputs``) so that eval still uses the
+        model directly.
+        """
+        mode = "train" if self.model.training else "eval"
+
+        if mode == "eval":
+            # For evaluation, use the standard TRL path.
+            return super()._prepare_inputs(generation_batch)
+
+        # Lazy registration on first training step
+        self._ensure_registered()
+
+        generate_every = self.args.steps_per_generation * self.num_iterations
+        if self._step % generate_every == 0 or self._buffered_inputs is None:
+            # ----------------------------------------------------------------
+            # Sync weights to the TRL vLLM server BEFORE fetching the next
+            # batch so that Atropos environments use the up-to-date policy.
+            # This mirrors exactly what _generate_and_score_completions does
+            # when use_vllm=True.
+            # ----------------------------------------------------------------
+            self._sync_weights_to_vllm()
+
+            # Fetch a fresh scored batch from the Atropos API
+            raw_batch = self._atropos_client.wait_for_batch()
+            self._last_raw_batch = raw_batch
+
+            prepared = self._convert_atropos_batch(raw_batch)
+
+            # Mirror the base class split-and-buffer logic so that
+            # steps_per_generation sub-batches are all used before the
+            # next fetch (same schedule as the parent's buffering).
+            from trl.trainer.utils import split_tensor_dict
+            batches = split_tensor_dict(prepared, self.args.steps_per_generation)
+            self._buffered_inputs = batches
+
+        inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
+        return inputs
+
+    # ---------------------------------------------------------------------- #
+    # Weight sync to TRL vLLM server                                          #
+    # ---------------------------------------------------------------------- #
+
+    def _sync_weights_to_vllm(self) -> None:
+        """
+        Push the current model weights to the TRL vLLM server.
+
+        This reuses the parent class's ``VLLMGeneration.sync_weights()``
+        exactly.  We call it ourselves because we bypass
+        ``_generate_and_score_completions``, which is normally where the
+        parent triggers the sync.
+
+        The ``_last_loaded_step`` guard (inherited from GRPOTrainer) ensures
+        we do not push redundant updates within the same global step.
+        """
+        if not self.use_vllm:
+            logger.warning(
+                "AtroposGRPOTrainer: use_vllm=False – cannot sync weights to "
+                "the TRL vLLM server.  Atropos environments will use stale "
+                "weights.  Set use_vllm=True with vllm_mode='server'."
+            )
+            return
+
+        if not hasattr(self, "vllm_generation"):
+            logger.warning(
+                "AtroposGRPOTrainer: vllm_generation not initialised – "
+                "weight sync skipped.  This should not happen when use_vllm=True."
+            )
+            return
+
+        if self.state.global_step != self._last_loaded_step:
+            try:
+                self.vllm_generation.sync_weights()
+                self._last_loaded_step = self.state.global_step
+                logger.debug(
+                    "Synced weights to TRL vLLM server at global step %d",
+                    self.state.global_step,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Weight sync to TRL vLLM server failed at step %d: %s",
+                    self.state.global_step,
+                    exc,
+                )
+
+    # ---------------------------------------------------------------------- #
+    # Atropos payload → TRL tensor dict conversion                            #
+    # ---------------------------------------------------------------------- #
+
+    def _convert_atropos_batch(
+        self, raw_batch: List[Dict[str, Any]]
+    ) -> dict[str, torch.Tensor | Any]:
+        """
+        Convert a list of Atropos trajectory dicts into the tensor dict
+        expected by ``compute_loss``.
+
+        This produces the same output shape as
+        ``_generate_and_score_completions`` so that all downstream loss
+        computation, logging, and metric code is completely unmodified.
+
+        Atropos trajectory fields (from ManagedServer nodes)
+        -----------------------------------------------------
+        tokens        : list[int]   full sequence (prompt+completion)
+        masked_tokens : list[int]   -100 for prompt, token_id for completion
+        logprobs      : list[float] 1.0 for masked positions, log-prob for completion tokens
+        scores        : float | list[float]  environment reward(s)
+
+        Optional / enrichment fields
+        -----------------------------
+        finish_reason  : str
+        prompt_text    : str  (for logging)
+        completion_text: str  (for logging)
+        """
+        device = self.accelerator.device
+        num_trajectories = len(raw_batch)
+        group_size = self._atropos_group_size
+
+        if num_trajectories % group_size != 0:
+            raise ValueError(
+                f"Atropos batch size {num_trajectories} is not divisible by "
+                f"group_size {group_size}.  Ensure the Atropos environment "
+                "group_size matches atropos_group_size in AtroposGRPOConfig."
+            )
+
+        # ------------------------------------------------------------------ #
+        # Step 1 – split tokens into prompt / completion                       #
+        # ------------------------------------------------------------------ #
+        # ManagedServer uses -100 in masked_tokens to mark prompt positions.
+        # We recover prompt_ids and completion_ids from that mask.
+
+        prompt_ids_list: List[List[int]] = []
+        completion_ids_list: List[List[int]] = []
+        completion_logps_list: List[List[float]] = []
+        scores_list: List[float] = []
+        prompt_texts: List[str] = []
+        completion_texts: List[str] = []
+
+        for item in raw_batch:
+            tokens: List[int] = item["tokens"]
+            masked: List[int] = item["masked_tokens"]
+            logprobs: List[float] = item["logprobs"]
+
+            if not (len(tokens) == len(masked) == len(logprobs)):
+                raise ValueError(
+                    f"Atropos trajectory has mismatched lengths: "
+                    f"tokens={len(tokens)}, masked_tokens={len(masked)}, "
+                    f"logprobs={len(logprobs)}"
+                )
+
+            # Find where the completion begins: first position where
+            # masked_tokens != -100.
+            completion_start = next(
+                (i for i, m in enumerate(masked) if m != -100),
+                len(tokens),
+            )
+
+            prompt_ids_list.append(tokens[:completion_start])
+            completion_ids_list.append(tokens[completion_start:])
+
+            # Atropos uses 1.0 as a sentinel for "masked / invalid" logprob.
+            # Slice only the completion portion and replace sentinels with 0.0
+            # so they don't contaminate the importance-sampling ratio.
+            raw_lps = logprobs[completion_start:]
+            completion_logps_list.append(
+                [lp if lp != 1.0 else 0.0 for lp in raw_lps]
+            )
+
+            # Normalise scores to a single float per trajectory
+            raw_score = item.get("scores", item.get("score", 0.0))
+            if isinstance(raw_score, (list, tuple)):
+                scores_list.append(float(sum(raw_score)))
+            else:
+                scores_list.append(float(raw_score))
+
+            prompt_texts.append(item.get("prompt_text", ""))
+            completion_texts.append(item.get("completion_text", ""))
+
+        # ------------------------------------------------------------------ #
+        # Step 2 – GRPO advantage computation                                  #
+        # ------------------------------------------------------------------ #
+        # Scores arrive already assigned by the Atropos environment.
+        # We apply group-relative normalisation to compute advantages,
+        # matching the standard GRPO formula used by the parent class.
+
+        scores_tensor = torch.tensor(scores_list, dtype=torch.float32)
+        num_groups = num_trajectories // group_size
+        grouped = scores_tensor.view(num_groups, group_size)
+        group_means = grouped.mean(dim=1, keepdim=True)
+        group_stds = grouped.std(dim=1, keepdim=True, unbiased=False)
+        advantages = ((grouped - group_means) / (group_stds + 1e-4)).view(-1)
+
+        # Log raw reward statistics (same keys as GRPOTrainer)
+        mode = "train"
+        self._metrics[mode]["reward"].append(scores_tensor.mean().item())
+        self._metrics[mode]["reward_std"].append(scores_tensor.std().item())
+
+        # ------------------------------------------------------------------ #
+        # Step 3 – pad and tensorise                                           #
+        # ------------------------------------------------------------------ #
+
+        pad_id = self._tokenizer.pad_token_id
+
+        # Prompt tensors (left-padded, matching GRPOTrainer convention)
+        prompt_tensors = [torch.tensor(ids, dtype=torch.long) for ids in prompt_ids_list]
+        prompt_ids = pad(
+            prompt_tensors,
+            padding_value=pad_id,
+            padding_side="left",
+            pad_to_multiple_of=self.pad_to_multiple_of,
+        ).to(device)
+        prompt_mask = pad(
+            [torch.ones_like(t) for t in prompt_tensors],
+            padding_value=0,
+            padding_side="left",
+            pad_to_multiple_of=self.pad_to_multiple_of,
+        ).to(device)
+
+        # Completion tensors (right-padded)
+        completion_tensors = [
+            torch.tensor(ids, dtype=torch.long) for ids in completion_ids_list
+        ]
+        completion_ids_t = pad(
+            completion_tensors,
+            padding_value=pad_id,
+            padding_side="right",
+            pad_to_multiple_of=self.pad_to_multiple_of,
+        ).to(device)
+        completion_mask = pad(
+            [torch.ones_like(t) for t in completion_tensors],
+            padding_value=0,
+            padding_side="right",
+            pad_to_multiple_of=self.pad_to_multiple_of,
+        ).to(device)
+
+        # Per-token sampling log-probs from the vLLM policy that generated
+        # the completions.  Used for the importance-sampling correction
+        # between the inference policy (vLLM) and the current training policy.
+        logp_tensors = [
+            torch.tensor(lps, dtype=torch.float32) for lps in completion_logps_list
+        ]
+        sampling_per_token_logps = pad(
+            logp_tensors,
+            padding_value=0.0,
+            padding_side="right",
+            pad_to_multiple_of=self.pad_to_multiple_of,
+        ).to(device)
+
+        # ------------------------------------------------------------------ #
+        # Step 4 – mask truncated completions (if configured)                  #
+        # ------------------------------------------------------------------ #
+        if self.mask_truncated_completions:
+            eos_and_pad = [self._tokenizer.eos_token_id, self._tokenizer.pad_token_id]
+            is_truncated = torch.tensor(
+                [ids[-1] not in eos_and_pad for ids in completion_ids_list],
+                device=device,
+            )
+            completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
+
+        # ------------------------------------------------------------------ #
+        # Step 5 – reference model logprobs (beta > 0)                        #
+        # ------------------------------------------------------------------ #
+        ref_per_token_logps: Optional[torch.Tensor] = None
+        if self.beta != 0.0:
+            ref_per_token_logps = self._compute_ref_logps(
+                prompt_ids=prompt_ids,
+                prompt_mask=prompt_mask,
+                completion_ids=completion_ids_t,
+                completion_mask=completion_mask,
+            )
+
+        # ------------------------------------------------------------------ #
+        # Step 6 – logging                                                     #
+        # ------------------------------------------------------------------ #
+        self._logs["prompt"].extend(prompt_texts)
+        self._logs["completion"].extend(completion_texts)
+        self._logs["rewards"]["atropos_env"].extend(scores_list)
+        self._logs["advantages"].extend(advantages.tolist())
+
+        # Completion length metrics (same keys as GRPOTrainer)
+        completion_lengths = torch.tensor(
+            [len(ids) for ids in completion_ids_list], dtype=torch.float32
+        )
+        self._metrics[mode]["completion_length"].append(completion_lengths.mean().item())
+
+        # ------------------------------------------------------------------ #
+        # Step 7 – assemble output dict (same shape as _generate_and_score)   #
+        # ------------------------------------------------------------------ #
+        # num_items_in_batch is used by DAPO / VESPO normalisation.
+        # For other loss types it is unused but must be present.
+        num_items_in_batch = int(completion_mask.sum().item())
+
+        output: dict[str, Any] = {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids_t,
+            "completion_mask": completion_mask,
+            "advantages": advantages.to(device),
+            "num_items_in_batch": num_items_in_batch,
+            # Sampling log-probs for the importance-sampling correction
+            # between the vLLM inference policy and the current train policy.
+            "sampling_per_token_logps": sampling_per_token_logps,
+        }
+
+        if ref_per_token_logps is not None:
+            output["ref_per_token_logps"] = ref_per_token_logps
+
+        return output
+
+    # ---------------------------------------------------------------------- #
+    # Reference model logprob computation                                     #
+    # ---------------------------------------------------------------------- #
+
+    @torch.no_grad()
+    def _compute_ref_logps(
+        self,
+        prompt_ids: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        completion_ids: torch.Tensor,
+        completion_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute per-token log-probabilities under the reference model for
+        the KL penalty term when beta > 0.
+
+        Re-uses the parent class ``_get_per_token_logps_and_entropies``
+        which correctly handles PEFT (adapter swap), DeepSpeed, and FSDP.
+        """
+        from trl.models.utils import disable_gradient_checkpointing
+
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+        batch_size = self.args.per_device_train_batch_size
+
+        with disable_gradient_checkpointing(
+            self.model, self.args.gradient_checkpointing_kwargs
+        ):
+            if self.ref_model is not None:
+                ref_logps, _ = self._get_per_token_logps_and_entropies(
+                    self.ref_model,
+                    input_ids,
+                    attention_mask,
+                    logits_to_keep,
+                    batch_size,
+                )
+            else:
+                # PEFT path: temporarily disable the active adapter to get
+                # base-model (reference) probabilities.
+                from accelerate.utils import is_peft_model
+                from trl.trainer.utils import use_adapter
+
+                model = self.accelerator.unwrap_model(self.model)
+                adapter_name = (
+                    "ref"
+                    if "ref" in getattr(model, "peft_config", {})
+                    else None
+                )
+                with use_adapter(model, adapter_name=adapter_name):
+                    ref_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.model,
+                        input_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size,
+                    )
+
+        return ref_logps
+
+    # ---------------------------------------------------------------------- #
+    # Dataloader override                                                      #
+    # ---------------------------------------------------------------------- #
+
+    def get_train_dataloader(self) -> DataLoader:
+        """
+        Return a DataLoader that drives the TRL training loop with placeholder
+        batches.
+
+        The actual training data comes from the Atropos API (fetched inside
+        ``_prepare_inputs``).  We still need a DataLoader to drive the TRL
+        training loop, so we create one that emits trivially small placeholder
+        dicts.  The ``steps_per_generation`` multiplication from the base class
+        is preserved so that the buffering logic works correctly.
+
+        If the user supplied a real dataset (e.g. for hybrid training), the
+        parent's implementation is used instead.
+        """
+        if not isinstance(self.train_dataset, _AtroposPlaceholderDataset):
+            return super().get_train_dataloader()
+
+        # Build a DataLoader whose length matches the expected training
+        # schedule so tqdm and early-stopping work correctly.
+        total_steps = getattr(self.args, "max_steps", None) or 10_000
+        # Match the batch size the base class uses (per-device × steps_per_gen)
+        batch_size = self._train_batch_size * self.args.steps_per_generation
+        dataset = _AtroposPlaceholderDataset(total_steps * batch_size)
+
+        def _collate(batch):
+            # Return a minimal dict; _prepare_inputs ignores it entirely.
+            return {"prompt": [""] * len(batch)}
+
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            collate_fn=_collate,
+            num_workers=0,
+        )
+
+    # ---------------------------------------------------------------------- #
+    # Startup helpers                                                          #
+    # ---------------------------------------------------------------------- #
+
+    def train(self, *args, **kwargs):
+        """
+        Verify connectivity to the Atropos API server before training starts,
+        then delegate to the standard TRL training loop.
+        """
+        logger.info(
+            "AtroposGRPOTrainer: connecting to Atropos API at %s",
+            self._atropos_args.atropos_api_url,
+        )
+        self._ensure_registered()
+        return super(GRPOTrainer, self).train(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Convenience factory
+# ---------------------------------------------------------------------------
+
+def make_atropos_trainer(
+    model: str,
+    atropos_api_url: str = "http://localhost:8000",
+    group_size: int = 8,
+    per_device_train_batch_size: int = 4,
+    max_steps: int = 1000,
+    output_dir: str = "./atropos_grpo_output",
+    # TRL vLLM server settings
+    vllm_server_host: str = "0.0.0.0",
+    vllm_server_port: int = 8001,
+    vllm_server_base_url: Optional[str] = None,
+    extra_config_kwargs: Optional[Dict[str, Any]] = None,
+    **trainer_kwargs,
+) -> AtroposGRPOTrainer:
+    """
+    Convenience factory for the most common configuration.
+
+    The trainer is wired to the TRL vLLM server (started separately via
+    ``trl vllm-serve``) for weight synchronisation.  The Atropos environment
+    microservices should be configured to call that same server for generation.
+
+    Args:
+        model: HuggingFace model ID or local path.
+        atropos_api_url: URL of the Atropos run-api server.
+        group_size: Number of completions per prompt (must match env config).
+        per_device_train_batch_size: Training micro-batch size per GPU.
+        max_steps: Total training steps.
+        output_dir: Directory for checkpoints and logs.
+        vllm_server_host: Host where `trl vllm-serve` is listening.
+        vllm_server_port: Port where `trl vllm-serve` is listening.
+        vllm_server_base_url: Optional explicit base URL (overrides host+port).
+        extra_config_kwargs: Additional kwargs passed to AtroposGRPOConfig.
+        **trainer_kwargs: Additional kwargs passed to AtroposGRPOTrainer.
+
+    Returns:
+        A configured AtroposGRPOTrainer ready to call .train() on.
+
+    Example::
+
+        trainer = make_atropos_trainer(
+            model="Qwen/Qwen2.5-1.5B-Instruct",
+            atropos_api_url="http://localhost:8000",
+            vllm_server_host="0.0.0.0",
+            vllm_server_port=8001,
+            group_size=8,
+            max_steps=500,
+        )
+        trainer.train()
+    """
+    config_kwargs: Dict[str, Any] = {
+        "output_dir": output_dir,
+        "per_device_train_batch_size": per_device_train_batch_size,
+        "num_generations": group_size,
+        "atropos_api_url": atropos_api_url,
+        "atropos_group_size": group_size,
+        "max_steps": max_steps,
+        # TRL vLLM server — always use server mode
+        "use_vllm": True,
+        "vllm_mode": "server",
+        "vllm_server_host": vllm_server_host,
+        "vllm_server_port": vllm_server_port,
+    }
+
+    if vllm_server_base_url:
+        config_kwargs["vllm_server_base_url"] = vllm_server_base_url
+
+    if extra_config_kwargs:
+        config_kwargs.update(extra_config_kwargs)
+
+    config = AtroposGRPOConfig(**config_kwargs)
+    return AtroposGRPOTrainer(model=model, args=config, **trainer_kwargs)
