@@ -6,30 +6,30 @@ A subclass of [TRL](https://github.com/huggingface/trl)'s `GRPOTrainer` that rep
 
 ## Table of Contents
 
-1. [Architecture Overview](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#architecture-overview)
-2. [How It Differs from GRPOTrainer](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#how-it-differs-from-grpotrainer)
-3. [Prerequisites](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#prerequisites)
-4. [Installation](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#installation)
-5. [The Four-Process Stack](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#the-four-process-stack)
-6. [Configuration Reference](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#configuration-reference)
-   * [AtroposGRPOConfig](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#atroposgrpoconfig)
-   * [Inherited GRPOConfig Fields](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#inherited-grpoconfig-fields)
-7. [API Reference](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#api-reference)
-   * [AtroposGRPOTrainer](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#atroposgrpotrainer-class)
-   * [AtroposAPIClient](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#atrosapiclient-class)
-   * [make_atropos_trainer](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#make_atropos_trainer)
-8. [The Atropos Batch Contract](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#the-atropos-batch-contract)
-9. [Training Loop Internals](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#training-loop-internals)
-10. [Weight Synchronisation](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#weight-synchronisation)
-11. [Advantage Computation](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#advantage-computation)
-12. [KL Penalty and Reference Model](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#kl-penalty-and-reference-model)
-13. [Evaluation](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#evaluation)
-14. [PEFT / LoRA Support](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#peft--lora-support)
-15. [Multi-GPU and Distributed Training](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#multi-gpu-and-distributed-training)
-16. [Logging and Metrics](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#logging-and-metrics)
-17. [Checkpointing and Resuming](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#checkpointing-and-resuming)
-18. [Troubleshooting](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#troubleshooting)
-19. [Design Decisions and Caveats](https://claude.ai/chat/9820972e-af62-4089-9abc-e865bb5177b5#design-decisions-and-caveats)
+1. [Architecture Overview](#architecture-overview)
+2. [How It Differs from GRPOTrainer](#how-it-differs-from-grpotrainer)
+3. [Prerequisites](#prerequisites)
+4. [Installation](#installation)
+5. [The Four-Process Stack](#the-four-process-stack)
+6. [Configuration Reference](#configuration-reference)
+   * [AtroposGRPOConfig](#atroposgrpoconfig)
+   * [Inherited GRPOConfig Fields](#inherited-grpoconfig-fields)
+7. [API Reference](#api-reference)
+   * [AtroposGRPOTrainer](#atroposgrpotrainer-class)
+   * [AtroposAPIClient](#atrosapiclient-class)
+   * [make_atropos_trainer](#make_atropos_trainer)
+8. [The Atropos Batch Contract](#the-atropos-batch-contract)
+9. [Training Loop Internals](#training-loop-internals)
+10. [Weight Synchronisation](#weight-synchronisation)
+11. [Advantage Computation](#advantage-computation)
+12. [KL Penalty and Reference Model](#kl-penalty-and-reference-model)
+13. [Evaluation](#evaluation)
+14. [PEFT / LoRA Support](#peft--lora-support)
+15. [Multi-GPU and Distributed Training](#multi-gpu-and-distributed-training)
+16. [Logging and Metrics](#logging-and-metrics)
+17. [Checkpointing and Resuming](#checkpointing-and-resuming)
+18. [Troubleshooting](#troubleshooting)
+19. [Design Decisions and Caveats](#design-decisions-and-caveats)
 
 ---
 
@@ -354,7 +354,7 @@ The Atropos API's `/batch` endpoint returns a list of trajectory dicts. Each dic
 | ------------------------ | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `tokens`               | `list[int]`               | Full token sequence: prompt tokens followed by completion tokens.                                                                                                                                                               |
 | `masks`                | `list[int]`               | `-100`for each prompt position; the actual token ID at each completion position. Used to recover the prompt/completion boundary. Matches the `masks`field from the server's `ScoredData`model.                              |
-| `inference_logprobs`   | `list[float]`             | `1.0`(sentinel) for each prompt position; the actual log-probability at each completion token position. Must be the log-prob of the**sampled**token under the policy that generated it (the TRL vLLM server). |
+| `inference_logprobs`   | `list[float]` (per-trajectory)  | Log-probabilities for each completion token position. Each trajectory has one float per token. Must be the log-prob of the **sampled** token under the policy that generated it (the TRL vLLM server). |
 | `scores`               | `float`or `list[float]` | The environment's reward for this trajectory. If a list, values are summed to a single float.                                                                                                                                   |
 
 The following fields are optional but used for logging:
