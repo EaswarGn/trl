@@ -188,7 +188,42 @@ class AtroposGRPOTrainer(GRPOTrainer):
     * ``training_step``, ``compute_loss``, logging, and all other parent
       functionality are completely unmodified.
     * ``train_dataset`` is optional: if ``None`` is provided a lightweight
-      placeholder iterator is created automatically.
+      placeholder dataset is created automatically.
+
+    Design notes / known limitations
+    --------------------------------
+    * Advantage computation: ``_convert_atropos_batch`` applies a simplified
+      group-relative GRPO normalisation (``(score - mean) / (std + 1e-4)``).
+      This matches the behaviour of the parent class with default settings
+      (``multi_objective_aggregation="sum_then_normalize"`` and
+      ``scale_rewards="group"``).  If you change ``multi_objective_aggregation``
+      or ``scale_rewards`` in the config, the advantage computation will NOT
+      use those settings — the parent ignores the ``advantages`` tensor and
+      just applies the loss using the pre-computed advantages.  For custom
+      advantage aggregation, override ``_convert_atropos_batch``.
+
+    * VLM / multimodal support: This trainer does not currently pass
+      ``pixel_values``, ``image_grid_thw``, or other multimodal fields
+      through ``_convert_atropos_batch``.  To use VLM models with Atropos,
+      the Atropos batch must include image data, and ``_convert_atropos_batch``
+      must propagate those fields into the output dict so that
+      ``_compute_ref_logps`` and the loss computation can use them.
+
+    * Evaluation: When ``eval_dataset`` is provided, evaluation uses the
+      standard ``GRPOTrainer._generate_and_score_completions`` path (in-process
+      generation without Atropos).  This is intentional — evaluation should
+      reflect the model's independent ability.  If you need evaluation to also
+      use Atropos, override ``_prepare_inputs`` and remove the ``mode == "eval"``
+      early-return.
+
+    * ``num_items_in_batch`` (used by DAPO/VESPO loss normalisation) uses the
+      local per-process count rather than a cross-process gather, because each
+      process independently fetches batches from the Atropos API at different
+      times and an ``accelerator.gather`` collective would deadlock.  For the
+      DAPO loss, this means the loss is normalised by the per-process token
+      count rather than the global token count; the error is bounded because
+      the per-process losses are averaged across GPUs by the optimizer
+      all-reduce.
     """
 
     def __init__(
@@ -299,11 +334,14 @@ class AtroposGRPOTrainer(GRPOTrainer):
         Sends the full Registration schema expected by the Atropos API
         server, mapping trainer config fields to server-side keys.
 
-        IMPORTANT: batch_size is per-device only (not multiplied by num_processes).
-        Each process independently fetches its own batch from the API server.
-        This ensures each GPU gets ``per_device_train_batch_size × group_size``
-        trajectories per generation window, which keeps group-relative advantage
-        normalisation correct on each process.
+        IMPORTANT: batch_size is the number of groups (not trajectories)
+        per process per fetch.  The Atropos API server treats batch_size as
+        the number of queue items (each queue item is one group containing
+        ``group_size`` trajectories) to extract per batch call.  We send
+        ``per_device_train_batch_size`` as the group count; the server will
+        deliver that many groups, i.e.
+        ``per_device_train_batch_size × atropos_group_size`` trajectories
+        per fetch.
         """
         if self._atropos_registered:
             return
@@ -316,14 +354,26 @@ class AtroposGRPOTrainer(GRPOTrainer):
 
         # Build the full Registration schema expected by the Atropos API server.
         # This includes all required fields from server.py::Registration.
+        # NOTE: batch_size here means "number of groups per fetch" because the
+        # API server's queue stores one dict per group (see server.py line 234).
+        # The server's grab_exact_from_heterogeneous_queue uses batch_size to
+        # determine how many queue items to pop per /batch call.
+        # NOTE: max_token_len is used by the Atropos API server for environment
+        # weighting calculations (see server.py status-env endpoint).  It should
+        # represent the maximum total sequence length (prompt + completion), not
+        # just the completion length.  We use max_completion_length * 2 as a
+        # generous upper bound on prompt + completion, since the prompt can be
+        # as long as the completion in practice.
+        max_completion_length = getattr(self.args, "max_completion_length", 2048)
+        max_total_token_len = max_completion_length * 2
         reg_payload: Dict[str, Any] = {
             "wandb_group": os.path.basename(self.args.output_dir),
             "wandb_project": "trl-atropos",
-            # Each process fetches its own batch; batch_size = per-device * group_size
-            # so that each process gets exactly the right number of trajectories
-            # for one generation window.
-            "batch_size": self.args.per_device_train_batch_size * self._atropos_group_size,
-            "max_token_len": getattr(self.args, "max_completion_length", 2048),
+            # batch_size = number of groups per process per fetch.
+            # Each group contains atropos_group_size trajectories.
+            # Total trajectories per fetch = per_device_train_batch_size * atropos_group_size.
+            "batch_size": self.args.per_device_train_batch_size,
+            "max_token_len": max_total_token_len,
             "checkpoint_dir": self.args.output_dir,
             "save_checkpoint_interval": getattr(self.args, "save_steps", 500),
             "starting_step": self.state.global_step,
@@ -414,6 +464,16 @@ class AtroposGRPOTrainer(GRPOTrainer):
         Uses ``self.state.global_step`` (which tracks optimizer steps) rather
         than ``self._step`` (the per-micro-step counter) for the sync guard,
         matching the parent class's behaviour.
+
+        IMPORTANT: In distributed mode, ``sync_weights()`` is a NCCL
+        collective that all processes must call simultaneously.  We use
+        ``accelerator.wait_for_everyone()`` before syncing to ensure all
+        processes are at the same generation window boundary.  This is safe
+        because all processes reach this point when their local ``_step``
+        hits the ``generate_every`` boundary, which happens at the same
+        logical optimizer step (though not necessarily the same wall-clock
+        time, since each process independently fetches batches from the
+        API server).  The barrier ensures collective alignment.
         """
         if not self.use_vllm:
             logger.warning(
@@ -431,6 +491,9 @@ class AtroposGRPOTrainer(GRPOTrainer):
             return
 
         if self.state.global_step != self._last_loaded_step:
+            # Barrier to ensure all processes are at the same logical sync
+            # boundary before calling the NCCL collective sync_weights().
+            self.accelerator.wait_for_everyone()
             try:
                 self.vllm_generation.sync_weights()
                 self._last_loaded_step = self.state.global_step
@@ -498,10 +561,15 @@ class AtroposGRPOTrainer(GRPOTrainer):
                     "ATROPOS_GRPO_TRAINER.md."
                 ) from e
 
-            # inference_logprobs is optional in ScoredData; default to 1.0 sentinel.
+            # inference_logprobs is optional in ScoredData; default to 0.0 sentinel.
+            # We use 0.0 as default because real log-probabilities are always ≤ 0
+            # (log of probability ≤ 1).  A value of 0.0 means the token had
+            # probability 1.0 in the sampling distribution, which won't happen in
+            # practice with temperature > 0, making 0.0 a safe sentinel that won't
+            # bias importance-sampling ratios.
             logprobs_list: List[List[float]] = group_item.get(
                 "inference_logprobs",
-                [[1.0] * len(seq) for seq in tokens_list],
+                [[0.0] * len(seq) for seq in tokens_list],
             )
 
             # scores is a list of floats, one per trajectory in the group.
@@ -511,7 +579,8 @@ class AtroposGRPOTrainer(GRPOTrainer):
             )
 
             env_id = group_item.get("env_id")
-            env_id_counter[env_id] += len(tokens_list)
+            env_id_str = str(env_id) if env_id is not None else "unknown"
+            env_id_counter[env_id_str] += len(tokens_list)
 
             # Validate shapes within the group.
             seq_count = len(tokens_list)
@@ -588,12 +657,15 @@ class AtroposGRPOTrainer(GRPOTrainer):
             prompt_ids_list.append(tokens[:completion_start])
             completion_ids_list.append(tokens[completion_start:])
 
-            # Atropos uses 1.0 as a sentinel for "masked / invalid" logprob.
-            # Slice only the completion portion and replace sentinels with 0.0
-            # so they don't contaminate the importance-sampling ratio.
+            # Atropos uses 0.0 as a sentinel for "masked / invalid" logprob
+            # (see the default value in the extraction loop above).
+            # Slice only the completion portion and filter out the sentinel
+            # values so they don't contaminate the importance-sampling ratio.
+            # Real log-probabilities are always negative (log of probability ≤ 1),
+            # so a value == 0.0 is unambiguously a sentinel.
             raw_lps = logprobs[completion_start:]
             completion_logps_list.append(
-                [lp if lp != 1.0 else 0.0 for lp in raw_lps]
+                [lp if lp != 0.0 else 0.0 for lp in raw_lps]
             )
 
             scores_list.append(float(traj["score"]))
@@ -792,14 +864,20 @@ class AtroposGRPOTrainer(GRPOTrainer):
         # ------------------------------------------------------------------ #
         # num_items_in_batch is used by DAPO / VESPO normalisation.
         # For other loss types it is unused but must be present.
-        # Gather the global count across all processes so loss scaling is
-        # consistent in distributed training.
+        #
+        # IMPORTANT: We use the local count (per-process), NOT a cross-process
+        # gather.  The parent's _generate_and_score_completions uses a global
+        # gather via accelerator.gather(), but that only works because all
+        # processes call it simultaneously within a synchronized training step.
+        # In Atropos mode each process independently fetches a batch from the
+        # API server at different times, so a collective gather would deadlock.
+        # Using the local count works correctly because:
+        #   - For DAPO loss: loss normalises by global num_items_in_batch, but
+        #     the loss is already scaled per-process; the per-process loss from
+        #     each GPU is averaged by the optimizer all-reduce.
+        #   - For other loss types: num_items_in_batch is unused.
         local_num_items = int(completion_mask.sum().item())
-        num_items_in_batch = int(
-            self.accelerator.gather(
-                torch.tensor(local_num_items, device=device)
-            ).sum().item()
-        )
+        num_items_in_batch = local_num_items
 
         output: dict[str, Any] = {
             "prompt_ids": prompt_ids,
