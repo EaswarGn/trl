@@ -202,13 +202,6 @@ class AtroposGRPOTrainer(GRPOTrainer):
       just applies the loss using the pre-computed advantages.  For custom
       advantage aggregation, override ``_convert_atropos_batch``.
 
-    * VLM / multimodal support: This trainer does not currently pass
-      ``pixel_values``, ``image_grid_thw``, or other multimodal fields
-      through ``_convert_atropos_batch``.  To use VLM models with Atropos,
-      the Atropos batch must include image data, and ``_convert_atropos_batch``
-      must propagate those fields into the output dict so that
-      ``_compute_ref_logps`` and the loss computation can use them.
-
     * Evaluation: When ``eval_dataset`` is provided, evaluation uses the
       standard ``GRPOTrainer._generate_and_score_completions`` path (in-process
       generation without Atropos).  This is intentional — evaluation should
@@ -917,12 +910,13 @@ class AtroposGRPOTrainer(GRPOTrainer):
         prompt_mask: torch.Tensor,
         completion_ids: torch.Tensor,
         completion_mask: torch.Tensor,
-        num_images: Optional[List[int]] = None,
-        **forward_kwargs,
     ) -> torch.Tensor:
         """
         Compute per-token log-probabilities under the reference model for
         the KL penalty term when beta > 0.
+
+        Text-only variant: no multimodal arguments are passed through since
+        the Atropos trainer sources data purely from the API (token IDs only).
 
         Re-uses the parent class ``_get_per_token_logps_and_entropies``
         which correctly handles PEFT (adapter swap), DeepSpeed, and FSDP.
@@ -932,9 +926,6 @@ class AtroposGRPOTrainer(GRPOTrainer):
             prompt_mask: Left-padded prompt attention mask.
             completion_ids: Right-padded completion token IDs.
             completion_mask: Right-padded completion attention mask.
-            num_images: Number of images per sample (for VLM support).
-            **forward_kwargs: Additional keyword arguments forwarded to
-                the model forward pass (e.g. pixel_values, image_grid_thw).
         """
         from trl.models.utils import disable_gradient_checkpointing
 
@@ -953,8 +944,6 @@ class AtroposGRPOTrainer(GRPOTrainer):
                     attention_mask,
                     logits_to_keep,
                     batch_size,
-                    num_images=num_images,
-                    **forward_kwargs,
                 )
             else:
                 # PEFT path: temporarily disable the active adapter to get
@@ -975,8 +964,6 @@ class AtroposGRPOTrainer(GRPOTrainer):
                         attention_mask,
                         logits_to_keep,
                         batch_size,
-                        num_images=num_images,
-                        **forward_kwargs,
                     )
 
         return ref_logps
