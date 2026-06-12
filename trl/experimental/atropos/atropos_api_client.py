@@ -122,12 +122,22 @@ class AtroposAPIClient:
         Poll /batch once and return the payload list if a batch is ready.
         Returns None if the server responded with 204 or the batch value is
         falsy (None / empty list).
+
+        Uses the internal ``_get`` helper for retry-on-transient-failure logic
+        (up to ``max_retries`` attempts with 2s backoff).
         """
-        url = f"{self.base_url}/batch"
-        resp = self._session.get(url, timeout=30.0)
+        try:
+            resp = self._get("/batch", timeout=30.0)
+        except requests.RequestException:
+            # Server may be temporarily unavailable; return None so the caller
+            # can retry on the next poll cycle.
+            return None
+
         if resp.status_code == 204:
             return None
-        resp.raise_for_status()
+        # _get already calls raise_for_status(), so if we get here the status
+        # is OK.  Still handle the 204 case explicitly for the edge where
+        # the server returns 204 after a redirect (not fully canonical).
         data = resp.json()
         # The API returns {"batch": [...]} or {"batch": None}
         if isinstance(data, dict):
