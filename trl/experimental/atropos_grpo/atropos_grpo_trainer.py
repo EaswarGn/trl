@@ -378,8 +378,7 @@ class AtroposGRPOTrainer(GRPOTrainer):
         # just the completion length.  We use max_completion_length * 2 as a
         # generous upper bound on prompt + completion, since the prompt can be
         # as long as the completion in practice.
-        max_completion_length = getattr(self.args, "max_completion_length", 2048)
-        max_total_token_len = max_completion_length * 2
+        
         reg_payload: Dict[str, Any] = {
             "wandb_group": os.path.basename(self.args.output_dir),
             "wandb_project": "trl-atropos",
@@ -387,7 +386,7 @@ class AtroposGRPOTrainer(GRPOTrainer):
             # Each group contains atropos_group_size trajectories.
             # Total trajectories per fetch = per_device_train_batch_size * atropos_group_size.
             "batch_size": self.args.per_device_train_batch_size,
-            "max_token_len": max_total_token_len,
+            "max_token_len": self.args.max_completion_length,
             "checkpoint_dir": self.args.output_dir,
             "save_checkpoint_interval": getattr(self.args, "save_steps", 500),
             "starting_step": self.state.global_step,
@@ -874,7 +873,7 @@ class AtroposGRPOTrainer(GRPOTrainer):
         #     each GPU is averaged by the optimizer all-reduce.
         #   - For other loss types: num_items_in_batch is unused.
         local_num_items = int(completion_mask.sum().item())
-        num_items_in_batch = local_num_items
+        num_items_in_batch = torch.tensor(local_num_items, device=device)
 
         output: dict[str, Any] = {
             "prompt_ids": prompt_ids,
