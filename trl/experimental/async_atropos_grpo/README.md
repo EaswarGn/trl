@@ -161,7 +161,7 @@ One or more environment processes that generate and score trajectories. Each env
 ```bash
 python environments/gsm8k_server.py process \
   --openai.model_name deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
-  --openai.base_url http://localhost:8000 \
+  --openai.base_url http://localhost:8000/v1 \
   --openai.server_type vllm_logprob \
   --env.group_size 8 \
   --env.tokenizer_name deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
