@@ -108,7 +108,7 @@ A full training run requires four separate processes, typically in four terminal
 Serves the model for generation and accepts weight updates from the trainer via NCCL. This is a **vanilla vLLM server** started with `VLLM_SERVER_DEV_MODE=1` and the NCCL weight transfer config, **not** `trl vllm-serve`.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 VLLM_SERVER_DEV_MODE=1 vllm serve Qwen/Qwen2.5-0.5B-Instruct \
+CUDA_VISIBLE_DEVICES=0 VLLM_SERVER_DEV_MODE=1 vllm serve deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
     --max-model-len 4096 \
     --logprobs-mode processed_logprobs \
     --weight-transfer-config '{"backend":"nccl"}'
@@ -159,11 +159,14 @@ run-api
 One or more environment processes that generate and score trajectories. Each environment must be pointed at the vLLM server.
 
 ```bash
-python atropos/environments/gsm8k_server.py serve \
-  --openai.model_name Qwen/Qwen2.5-0.5B-Instruct \
-  --openai.base_url http://localhost:8001 \
+python environments/gsm8k_server.py process \
+  --openai.model_name deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --openai.base_url http://localhost:8000 \
+  --openai.server_type vllm_logprob \
   --env.group_size 8 \
-  --slurm false
+  --env.tokenizer_name deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --env.max_token_length 3072 \
+  --slurm false 
 ```
 
 The `--openai.base_url` must point to the **vLLM server** (not any separate instance).
