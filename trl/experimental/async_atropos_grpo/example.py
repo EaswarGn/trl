@@ -57,7 +57,7 @@ def main():
         atropos_max_retries=3,
         atropos_max_inflight_batches=2,
         # --- vLLM server (vanilla vLLM with VLLM_SERVER_DEV_MODE=1) ---
-        vllm_server_base_url="http://localhost:8001",
+        vllm_server_base_url="http://localhost:9001",
         vllm_server_timeout=240.0,
         weight_sync_steps=1,
         # --- Training hyperparameters ---
@@ -67,7 +67,6 @@ def main():
         temperature=1.0,
         epsilon=0.2,
         epsilon_high=0.28,
-        beta=0.0,              # disable KL penalty for simplicity
         max_steps=100,         # total optimizer steps
         logging_steps=1,
         save_steps=50,
