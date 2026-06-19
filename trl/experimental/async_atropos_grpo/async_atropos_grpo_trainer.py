@@ -54,10 +54,11 @@ from collections.abc import Callable
 from typing import Any
 
 from datasets import Dataset, IterableDataset
+import torch
 from transformers import PreTrainedTokenizerBase, TrainerCallback
 
 from trl.experimental.async_grpo import AsyncGRPOTrainer, AsyncGRPOConfig
-from trl.experimental.async_grpo.async_grpo_trainer import EnvironmentFactory, RewardFunc
+from trl.experimental.async_grpo.async_grpo_trainer import EnvironmentFactory, RewardFunc, RolloutWorkerProtocol
 from trl.experimental.async_grpo.weight_transfer import WeightTransferClient
 
 from .async_atropos_grpo_config import AsyncAtroposGRPOConfig
@@ -117,11 +118,11 @@ class AsyncAtroposGRPOTrainer(AsyncGRPOTrainer):
         train_dataset: Dataset | IterableDataset | None = None,
         processing_class: PreTrainedTokenizerBase | None = None,
         callbacks: list[TrainerCallback] | None = None,
-        optimizers: tuple[Any, Any] | None = None,
+        optimizers: tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None),
         tools: list[Callable] | None = None,
         environment_factory: EnvironmentFactory | None = None,
         # Allow injecting a custom rollout worker (e.g. for testing)
-        rollout_worker=None,
+        rollout_worker: RolloutWorkerProtocol | None = None,
         **kwargs,
     ):
         # Default config
@@ -190,54 +191,14 @@ class AsyncAtroposGRPOTrainer(AsyncGRPOTrainer):
             **kwargs,
         )
 
-        # ------------------------------------------------------------------ #
-        # FIX: Create WeightTransferClient if the parent skipped it
-        # ------------------------------------------------------------------ #
-        # When a custom rollout_worker is passed, AsyncGRPOTrainer.__init__
-        # sets self.weight_transfer = None.  We need weight transfer to push
-        # model updates to the vLLM server so the Atropos environments
-        # generate from the latest policy.  Create it now.
-        if self.weight_transfer is None and self.accelerator.is_main_process:
-            self._init_weight_transfer_for_atropos()
-
         # Registration state
         self._atropos_registered = False
-
-    def _init_weight_transfer_for_atropos(self) -> None:
-        """Create WeightTransferClient for pushing weights to the vLLM server.
-
-        This replicates the weight metadata collection that the parent does
-        in its default path (when no custom rollout_worker is given).
-        """
-        weight_names, weight_dtype_names, weight_shapes = [], [], []
-        for name, param in self.model.named_parameters():
-            # DDP/FSDP1 wrapping — strip "module." prefix if present
-            name = name.removeprefix("module.")
-            weight_names.append(name)
-            weight_dtype_names.append(str(param.dtype).split(".")[-1])
-            weight_shapes.append(list(param.shape))
-
-        self.weight_transfer = WeightTransferClient(
-            vllm_server_url=self.args.vllm_server_base_url,
-            server_timeout=self.args.vllm_server_timeout,
-            weight_update_info={
-                "names": weight_names,
-                "dtype_names": weight_dtype_names,
-                "shapes": weight_shapes,
-                "packed": True,
-                "is_checkpoint_format": True,
-            },
-        )
-        logger.info(
-            "Created WeightTransferClient for vLLM server at %s",
-            self.args.vllm_server_base_url,
-        )
 
     # ------------------------------------------------------------------ #
     # Atropos registration                                                 #
     # ------------------------------------------------------------------ #
 
-    def _ensure_registered(self) -> None:
+    def _check_atropos_server_health(self) -> None:
         """Register with the Atropos API server exactly once."""
         if self._atropos_registered:
             return
@@ -269,21 +230,24 @@ class AsyncAtroposGRPOTrainer(AsyncGRPOTrainer):
         self._atropos_registered = True
 
     # ------------------------------------------------------------------ #
-    # train() override                                                      #
+    # inner_training_loop() override                                                      #
     # ------------------------------------------------------------------ #
 
-    def train(self, *args, **kwargs):
+    def _inner_training_loop(self, *args, **kwargs):
         """Register with Atropos, then start the async training loop."""
         # Only register on the main process
         if self.accelerator.is_main_process:
-            self._ensure_registered()
+            self._check_atropos_server_health()
 
         # Barrier so all processes wait for registration before proceeding
         self.accelerator.wait_for_everyone()
 
-        try:
-            return super().train(*args, **kwargs)
-        finally:
-            # Clean shutdown — the parent's _inner_training_loop handles
-            # rollout_worker.stop() and weight_transfer.destroy().
-            pass
+        if self._atropos_registered: 
+            try:
+                return super()._inner_training_loop(*args, **kwargs)
+            finally:
+                if self.accelerator.is_main_process:
+                    if self.rollout_worker:
+                        self.rollout_worker.stop()
+                    if self.weight_transfer:
+                        self.weight_transfer.destroy()
