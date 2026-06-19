@@ -111,17 +111,18 @@ Serves the model for generation and accepts weight updates from the trainer via 
 CUDA_VISIBLE_DEVICES=0 VLLM_SERVER_DEV_MODE=1 vllm serve deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
     --max-model-len 4096 \
     --logprobs-mode processed_logprobs \
-    --weight-transfer-config '{"backend":"nccl"}'
+    --weight-transfer-config '{"backend":"nccl"}' \
+    --port 9001
 ```
 
 Key flags:
 
-| Flag / Env Var | Purpose |
-|----------------|---------|
-| `VLLM_SERVER_DEV_MODE=1` | Enables the weight transfer HTTP endpoints (`/health`, `/get_world_size`, `/init_weight_transfer_engine`, `/update_weights`, `/pause`, `/resume`) that the `WeightTransferClient` calls. Without this, NCCL weight sync will fail. |
-| `--max-model-len <N>` | Context window. Set to at least `max_prompt_length + max_completion_length`. Lower values reduce GPU memory usage. |
-| `--logprobs-mode processed_logprobs` | Ensures logprobs are returned in a format compatible with the trainer's loss computation. |
-| `--weight-transfer-config '{"backend":"nccl"}'` | Enables the NCCL weight transfer engine that the trainer's `WeightTransferClient` connects to. |
+| Flag / Env Var                                    | Purpose                                                                                                                                                                                                                                          |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `VLLM_SERVER_DEV_MODE=1`                        | Enables the weight transfer HTTP endpoints (`/health`, `/get_world_size`, `/init_weight_transfer_engine`, `/update_weights`, `/pause`, `/resume`) that the `WeightTransferClient` calls. Without this, NCCL weight sync will fail. |
+| `--max-model-len <N>`                           | Context window. Set to at least `max_prompt_length + max_completion_length`. Lower values reduce GPU memory usage.                                                                                                                             |
+| `--logprobs-mode processed_logprobs`            | Ensures logprobs are returned in a format compatible with the trainer's loss computation.                                                                                                                                                        |
+| `--weight-transfer-config '{"backend":"nccl"}'` | Enables the NCCL weight transfer engine that the trainer's `WeightTransferClient` connects to.                                                                                                                                                 |
 
 **GPU isolation note (important):** In async server mode, the vLLM server and the trainer must run on **separate GPUs**. Use `CUDA_VISIBLE_DEVICES` to partition your GPUs. For example, with 2 GPUs, run the vLLM server on GPU 0 and the trainer on GPU 1:
 
@@ -161,7 +162,7 @@ One or more environment processes that generate and score trajectories. Each env
 ```bash
 python environments/gsm8k_server.py process \
   --openai.model_name deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
-  --openai.base_url http://localhost:8000/v1 \
+  --openai.base_url http://localhost:9001/v1 \
   --openai.server_type vllm_logprob \
   --env.group_size 8 \
   --env.tokenizer_name deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
@@ -354,17 +355,18 @@ The trainer's `compute_loss` is completely agnostic to which worker produced the
 
 ## How It Differs from `AsyncGRPOTrainer`
 
-| Aspect | `AsyncGRPOTrainer` | `AsyncAtroposGRPOTrainer` |
-|--------|-------------------|---------------------------|
-| **Rollout generation** | Child process generates via vLLM HTTP `/v1/completions` | Child process polls Atropos API `/batch` |
-| **Reward computation** | Reward funcs applied in child process on generated completions | Scores come pre-computed from Atropos environment |
-| **Rollout worker** | `AsyncRolloutWorker` | `AtroposRolloutWorker` |
-| **vLLM server** | Uses `trl vllm-serve` with NCCL weight transfer | Uses vanilla `vllm serve` with `VLLM_SERVER_DEV_MODE=1` and NCCL weight transfer |
-| **Dataset requirement** | `train_dataset` is required | `train_dataset` is optional (prompts come from Atropos environment) |
-| **`reward_funcs` requirement** | Required | Optional -- defaults to pass-through that returns all zeros |
-| **Weight transfer setup** | Created automatically by parent | Created by subclass after `super().__init__()` because passing a custom `rollout_worker` causes the parent to skip weight transfer creation |
+| Aspect                                 | `AsyncGRPOTrainer`                                           | `AsyncAtroposGRPOTrainer`                                                                                                                     |
+| -------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Rollout generation**           | Child process generates via vLLM HTTP `/v1/completions`      | Child process polls Atropos API `/batch`                                                                                                      |
+| **Reward computation**           | Reward funcs applied in child process on generated completions | Scores come pre-computed from Atropos environment                                                                                               |
+| **Rollout worker**               | `AsyncRolloutWorker`                                         | `AtroposRolloutWorker`                                                                                                                        |
+| **vLLM server**                  | Uses `trl vllm-serve` with NCCL weight transfer              | Uses vanilla `vllm serve` with `VLLM_SERVER_DEV_MODE=1` and NCCL weight transfer                                                            |
+| **Dataset requirement**          | `train_dataset` is required                                  | `train_dataset` is optional (prompts come from Atropos environment)                                                                           |
+| **`reward_funcs` requirement** | Required                                                       | Optional -- defaults to pass-through that returns all zeros                                                                                     |
+| **Weight transfer setup**        | Created automatically by parent                                | Created by subclass after `super().__init__()` because passing a custom `rollout_worker` causes the parent to skip weight transfer creation |
 
 **Everything else is inherited unchanged:**
+
 - `compute_loss()` -- full GRPO loss with clipping
 - `_sync_weight()` -- NCCL weight transfer to vLLM dev-mode server
 - `get_train_dataloader()` -- `RolloutQueueDataset` draining the shared queue
@@ -383,47 +385,47 @@ Inherits all fields from `AsyncGRPOConfig`, which inherits from `_BaseConfig` (w
 
 #### Atropos-specific fields
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `atropos_api_url` | `str` | `"http://localhost:8000"` | Base URL of the Atropos `run-api` server |
-| `atropos_group_size` | `int` | `8` | Completions per prompt group. Must match the environment's `group_size` |
-| `atropos_trainer_id` | `str` | `"trl_async_atropos"` | Identifier sent to the Atropos API on `/register` |
-| `atropos_batch_timeout` | `float` | `300.0` | Seconds to wait for a batch before `TimeoutError` |
-| `atropos_poll_interval` | `float` | `1.0` | Seconds between `/batch` polls when no data is available |
-| `atropos_max_retries` | `int` | `3` | HTTP retries on transient failures |
-| `atropos_max_inflight_batches` | `int` | `2` | Max batches to buffer locally. Larger values smooth latency but risk stale policy data |
+| Field                            | Type      | Default                     | Description                                                                            |
+| -------------------------------- | --------- | --------------------------- | -------------------------------------------------------------------------------------- |
+| `atropos_api_url`              | `str`   | `"http://localhost:8000"` | Base URL of the Atropos `run-api` server                                             |
+| `atropos_group_size`           | `int`   | `8`                       | Completions per prompt group. Must match the environment's `group_size`              |
+| `atropos_trainer_id`           | `str`   | `"trl_async_atropos"`     | Identifier sent to the Atropos API on `/register`                                    |
+| `atropos_batch_timeout`        | `float` | `300.0`                   | Seconds to wait for a batch before `TimeoutError`                                    |
+| `atropos_poll_interval`        | `float` | `1.0`                     | Seconds between `/batch` polls when no data is available                             |
+| `atropos_max_retries`          | `int`   | `3`                       | HTTP retries on transient failures                                                     |
+| `atropos_max_inflight_batches` | `int`   | `2`                       | Max batches to buffer locally. Larger values smooth latency but risk stale policy data |
 
 #### Inherited async pipeline fields (from `AsyncGRPOConfig`)
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_inflight_tasks` | `int` | `-1` (auto) | Max concurrent generation tasks. Auto = `max_staleness * samples_per_step` |
-| `max_staleness` | `int` | `4` | Max weight update steps a rollout can lag before being discarded |
-| `queue_maxsize` | `int` | `1024` | Max rollout samples to buffer in the queue |
-| `weight_sync_steps` | `int` | `1` | Optimizer steps between weight synchronizations to vLLM |
-| `heartbeat_stale_after_s` | `float` | `300.0` | Seconds without heartbeat after which the worker is treated as hung |
+| Field                       | Type      | Default       | Description                                                                 |
+| --------------------------- | --------- | ------------- | --------------------------------------------------------------------------- |
+| `max_inflight_tasks`      | `int`   | `-1` (auto) | Max concurrent generation tasks. Auto =`max_staleness * samples_per_step` |
+| `max_staleness`           | `int`   | `4`         | Max weight update steps a rollout can lag before being discarded            |
+| `queue_maxsize`           | `int`   | `1024`      | Max rollout samples to buffer in the queue                                  |
+| `weight_sync_steps`       | `int`   | `1`         | Optimizer steps between weight synchronizations to vLLM                     |
+| `heartbeat_stale_after_s` | `float` | `300.0`     | Seconds without heartbeat after which the worker is treated as hung         |
 
 #### Inherited vLLM server fields (from `AsyncGRPOConfig`)
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `vllm_server_base_url` | `str` | `"http://localhost:8000"` | Base URL of the vLLM server (must be running with `VLLM_SERVER_DEV_MODE=1`) |
-| `vllm_server_timeout` | `float` | `240.0` | Seconds to wait for the vLLM server to be ready |
-| `request_timeout` | `int` | `600` | Timeout for individual HTTP requests to vLLM |
+| Field                    | Type      | Default                     | Description                                                                   |
+| ------------------------ | --------- | --------------------------- | ----------------------------------------------------------------------------- |
+| `vllm_server_base_url` | `str`   | `"http://localhost:8000"` | Base URL of the vLLM server (must be running with `VLLM_SERVER_DEV_MODE=1`) |
+| `vllm_server_timeout`  | `float` | `240.0`                   | Seconds to wait for the vLLM server to be ready                               |
+| `request_timeout`      | `int`   | `600`                     | Timeout for individual HTTP requests to vLLM                                  |
 
 #### Inherited training fields (from `AsyncGRPOConfig`)
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `num_generations` | `int` | `8` | Number of generations per prompt. Should match `atropos_group_size` |
-| `max_completion_length` | `int` | `2048` | Max tokens to generate per completion |
-| `temperature` | `float` | `1.0` | Sampling temperature |
-| `epsilon` | `float` | `0.2` | Lower-bound clipping epsilon |
-| `epsilon_high` | `float` | `0.2` | Upper-bound clipping epsilon (DAPO recommends `0.28`) |
-| `learning_rate` | `float` | `1e-6` | AdamW learning rate |
-| `logging_steps` | `float` | `1` | Log every N steps |
-| `log_completions` | `bool` | `False` | Whether to log prompt/completion samples |
-| `num_completions_to_print` | `int` | `3` | Number of completions to print when logging |
+| Field                        | Type      | Default   | Description                                                           |
+| ---------------------------- | --------- | --------- | --------------------------------------------------------------------- |
+| `num_generations`          | `int`   | `8`     | Number of generations per prompt. Should match `atropos_group_size` |
+| `max_completion_length`    | `int`   | `2048`  | Max tokens to generate per completion                                 |
+| `temperature`              | `float` | `1.0`   | Sampling temperature                                                  |
+| `epsilon`                  | `float` | `0.2`   | Lower-bound clipping epsilon                                          |
+| `epsilon_high`             | `float` | `0.2`   | Upper-bound clipping epsilon (DAPO recommends `0.28`)               |
+| `learning_rate`            | `float` | `1e-6`  | AdamW learning rate                                                   |
+| `logging_steps`            | `float` | `1`     | Log every N steps                                                     |
+| `log_completions`          | `bool`  | `False` | Whether to log prompt/completion samples                              |
+| `num_completions_to_print` | `int`   | `3`     | Number of completions to print when logging                           |
 
 ---
 
@@ -462,15 +464,15 @@ All other parameters are passed through to `AsyncGRPOTrainer.__init__`.
 
 **Key methods:**
 
-| Method | Source | Description |
-|--------|--------|-------------|
-| `train()` | Override | Health-checks Atropos API, then delegates to `AsyncGRPOTrainer.train()` |
-| `_ensure_registered()` | New | Verifies Atropos API reachability (registration happens in child process) |
-| `_init_weight_transfer_for_atropos()` | New | Creates `WeightTransferClient` after parent skips it due to custom `rollout_worker` |
-| `compute_loss()` | Inherited | Full GRPO loss with all variants (DAPO, DR-GRPO, SAPO, VESPO, LUSPO) |
-| `_sync_weight()` | Inherited | NCCL weight broadcast to vLLM dev-mode server |
-| `get_train_dataloader()` | Inherited | `RolloutQueueDataset` draining the shared queue |
-| `log()` | Inherited | Metric averaging and logging |
+| Method                                  | Source    | Description                                                                             |
+| --------------------------------------- | --------- | --------------------------------------------------------------------------------------- |
+| `train()`                             | Override  | Health-checks Atropos API, then delegates to `AsyncGRPOTrainer.train()`               |
+| `_ensure_registered()`                | New       | Verifies Atropos API reachability (registration happens in child process)               |
+| `_init_weight_transfer_for_atropos()` | New       | Creates `WeightTransferClient` after parent skips it due to custom `rollout_worker` |
+| `compute_loss()`                      | Inherited | Full GRPO loss with all variants (DAPO, DR-GRPO, SAPO, VESPO, LUSPO)                    |
+| `_sync_weight()`                      | Inherited | NCCL weight broadcast to vLLM dev-mode server                                           |
+| `get_train_dataloader()`              | Inherited | `RolloutQueueDataset` draining the shared queue                                       |
+| `log()`                               | Inherited | Metric averaging and logging                                                            |
 
 ### `AtroposRolloutWorker` class
 
@@ -495,17 +497,17 @@ class AtroposRolloutWorker:
 
 **Public attributes (the `RolloutWorkerProtocol` interface):**
 
-| Attribute | Type | Description |
-|-----------|------|-------------|
+| Attribute          | Type         | Description                                             |
+| ------------------ | ------------ | ------------------------------------------------------- |
 | `rollout_buffer` | `mp.Queue` | Shared queue where `RolloutSample` objects are pushed |
-| `model_version` | `int` | Current policy version (shared with child process) |
+| `model_version`  | `int`      | Current policy version (shared with child process)      |
 
-| Method | Description |
-|--------|-------------|
-| `start()` | Spawn the child process and wait for it to signal readiness |
-| `stop()` | Signal shutdown and join the child process |
-| `check_health(stale_after_s)` | Raise if the child crashed or heartbeat is stale |
-| `update_model_version(version)` | Propagate the new model version to the child |
+| Method                            | Description                                                 |
+| --------------------------------- | ----------------------------------------------------------- |
+| `start()`                       | Spawn the child process and wait for it to signal readiness |
+| `stop()`                        | Signal shutdown and join the child process                  |
+| `check_health(stale_after_s)`   | Raise if the child crashed or heartbeat is stale            |
+| `update_model_version(version)` | Propagate the new model version to the child                |
 
 ---
 
@@ -515,20 +517,20 @@ The Atropos API's `/batch` endpoint returns a list of **group dicts**. Each grou
 
 ### Required fields (from each group dict)
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `tokens` | `list[list[int]]` | Full token sequences (prompt + completion). One sequence per trajectory. |
-| `masks` | `list[list[int]]` | Mask for each sequence: `-100` for prompt tokens, the actual token ID for completion tokens. |
+| Field                  | Type                  | Description                                                                                      |
+| ---------------------- | --------------------- | ------------------------------------------------------------------------------------------------ |
+| `tokens`             | `list[list[int]]`   | Full token sequences (prompt + completion). One sequence per trajectory.                         |
+| `masks`              | `list[list[int]]`   | Mask for each sequence:`-100` for prompt tokens, the actual token ID for completion tokens.    |
 | `inference_logprobs` | `list[list[float]]` | Log-probabilities of each completion token under the generating policy. One list per trajectory. |
-| `scores` | `list[float]` | Reward score per trajectory in the group. |
+| `scores`             | `list[float]`       | Reward score per trajectory in the group.                                                        |
 
 ### Optional fields
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `env_id` | `int` | Source environment identifier (logged for multi-environment awareness) |
-| `prompt_text` | `str` | Human-readable prompt (for logging) |
-| `completion_text` | `str` | Human-readable completion (for logging) |
+| Field               | Type    | Description                                                            |
+| ------------------- | ------- | ---------------------------------------------------------------------- |
+| `env_id`          | `int` | Source environment identifier (logged for multi-environment awareness) |
+| `prompt_text`     | `str` | Human-readable prompt (for logging)                                    |
+| `completion_text` | `str` | Human-readable completion (for logging)                                |
 
 ### Validation rules enforced by `_convert_batch`
 
@@ -630,6 +632,7 @@ The `1e-4` epsilon prevents division by zero when all completions in a group rec
 The trainer uses `accelerate` for distributed training, inherited from `AsyncGRPOTrainer` -> `_BaseTrainer` -> `transformers.Trainer`.
 
 **DataLoader:** Uses `split_batches=True` and `dispatch_batches=True` in the accelerator config (set in `AsyncGRPOConfig.__post_init__`). This ensures:
+
 - The main process drives the `RolloutQueueDataset` (only rank 0 has data).
 - Accelerate's `DataLoaderDispatcher` broadcasts each batch to all ranks.
 
@@ -670,25 +673,25 @@ The trainer reports all metrics inherited from `AsyncGRPOTrainer` plus the metri
 
 ### Inherited metrics (from `compute_loss`)
 
-| Metric key | Description |
-|------------|-------------|
-| `train/ratio` | Mean importance sampling ratio |
-| `train/kl` | Approximate KL divergence (per token) |
-| `train/entropy` | Mean policy entropy |
-| `train/clip_ratio` | Fraction of clipped tokens |
-| `train/completions/mean_length` | Mean completion length in tokens |
-| `train/training_tok/s` | Training throughput (completion tokens per second) |
-| `train/forward_time_s` | Forward pass time per step |
-| `train/train_seq_len` | Local maximum sequence length |
-| `train/weight_sync_time_s` | Time for weight synchronization |
+| Metric key                        | Description                                        |
+| --------------------------------- | -------------------------------------------------- |
+| `train/ratio`                   | Mean importance sampling ratio                     |
+| `train/kl`                      | Approximate KL divergence (per token)              |
+| `train/entropy`                 | Mean policy entropy                                |
+| `train/clip_ratio`              | Fraction of clipped tokens                         |
+| `train/completions/mean_length` | Mean completion length in tokens                   |
+| `train/training_tok/s`          | Training throughput (completion tokens per second) |
+| `train/forward_time_s`          | Forward pass time per step                         |
+| `train/train_seq_len`           | Local maximum sequence length                      |
+| `train/weight_sync_time_s`      | Time for weight synchronization                    |
 
 ### Worker metrics (from `RolloutSample.metrics`)
 
-| Metric key | Description |
-|------------|-------------|
-| `train/reward` | Mean raw environment score across the batch |
-| `train/reward_std` | Standard deviation of raw scores |
-| `train/reward_mean` | Mean of scorable rewards |
+| Metric key                  | Description                                            |
+| --------------------------- | ------------------------------------------------------ |
+| `train/reward`            | Mean raw environment score across the batch            |
+| `train/reward_std`        | Standard deviation of raw scores                       |
+| `train/reward_mean`       | Mean of scorable rewards                               |
 | `train/queue_wait_time_s` | Time the dataloader waited for a sample from the queue |
 
 ### Logging configuration
@@ -707,21 +710,27 @@ config = AsyncAtroposGRPOConfig(
 ## Troubleshooting
 
 ### `ConnectionError: Cannot reach Atropos API at http://localhost:8000`
+
 The Atropos `run-api` server is not running or is not reachable. Start it with `run-api` and verify with:
+
 ```bash
 curl http://localhost:8000/
 ```
 
 ### `TimeoutError: No batch available from Atropos API within 300s`
+
 No Atropos environment is running, or the environment has crashed. Check that:
+
 1. `run-api` shows environment connections in its logs.
 2. The environment process is alive and generating.
 3. The environment's `group_size` matches `atropos_group_size` in the config.
 
 ### `ValueError: Atropos batch size N is not divisible by group_size M`
+
 The `group_size` configured in your Atropos environment does not match `atropos_group_size` in `AsyncAtroposGRPOConfig`. They must be equal.
 
 ### Weight sync failed / vLLM returns old model outputs
+
 1. Verify the vLLM server was started with `VLLM_SERVER_DEV_MODE=1`. Without this, the weight transfer HTTP endpoints will not be available and `WeightTransferClient` will fail.
 2. Verify `--max-model-len` is large enough to accommodate prompt + completion.
 3. Check `vllm_server_base_url` in your config matches the server's address.
@@ -729,6 +738,7 @@ The `group_size` configured in your Atropos environment does not match `atropos_
 5. Increase `vllm_server_timeout` if the server takes long to load the model.
 
 ### CUDA out of memory
+
 - Reduce `--max-model-len` on the vLLM server.
 - Reduce `per_device_train_batch_size`.
 - Enable `gradient_checkpointing=True`.
@@ -736,7 +746,9 @@ The `group_size` configured in your Atropos environment does not match `atropos_
 - Separate vLLM and trainer across different GPUs.
 
 ### Child process crashes silently
+
 The child process heartbeat becomes stale. The parent will raise `RuntimeError: Rollout worker heartbeat stale`. Check:
+
 1. The child's stderr for tracebacks (visible in the parent's stderr via the `exception_info_queue`).
 2. That `atropos_poll_interval` and `atropos_batch_timeout` are reasonable for your environment's latency.
 
@@ -784,14 +796,14 @@ The child process checks `_stop_event.is_set()` in its main loop and in `_wait_f
 
 ## File Reference
 
-| File | Purpose | Key Classes |
-|------|---------|-------------|
-| `__init__.py` | Public API exports | -- |
-| `async_atropos_grpo_config.py` | Configuration dataclass | `AsyncAtroposGRPOConfig` |
-| `atropos_rollout_worker.py` | Atropos-backed rollout worker | `AtroposRolloutWorker`, `_AtroposPollingLoop` |
-| `async_atropos_grpo_trainer.py` | Trainer subclass | `AsyncAtroposGRPOTrainer` |
-| `example.py` | Minimal training example | -- |
-| `README.md` | This file | -- |
+| File                              | Purpose                       | Key Classes                                       |
+| --------------------------------- | ----------------------------- | ------------------------------------------------- |
+| `__init__.py`                   | Public API exports            | --                                                |
+| `async_atropos_grpo_config.py`  | Configuration dataclass       | `AsyncAtroposGRPOConfig`                        |
+| `atropos_rollout_worker.py`     | Atropos-backed rollout worker | `AtroposRolloutWorker`, `_AtroposPollingLoop` |
+| `async_atropos_grpo_trainer.py` | Trainer subclass              | `AsyncAtroposGRPOTrainer`                       |
+| `example.py`                    | Minimal training example      | --                                                |
+| `README.md`                     | This file                     | --                                                |
 
 ### Dependencies
 
