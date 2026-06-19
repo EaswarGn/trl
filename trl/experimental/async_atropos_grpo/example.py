@@ -8,7 +8,7 @@ have the following services running:
 
 1. **vLLM server** (vanilla vLLM with dev mode and NCCL weight transfer):
    ``CUDA_VISIBLE_DEVICES=0 VLLM_SERVER_DEV_MODE=1 vllm serve \\
-       Qwen/Qwen2.5-0.5B-Instruct \\
+       deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \\
        --max-model-len 4096 \\
        --logprobs-mode processed_logprobs \\
        --weight-transfer-config '{"backend":"nccl"}'``
@@ -18,7 +18,7 @@ have the following services running:
 
 3. **Atropos environment** (generates and scores trajectories):
    ``python atropos/environments/gsm8k_server.py serve \\
-       --openai.model_name Qwen/Qwen2.5-0.5B-Instruct \\
+       --openai.model_name deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \\
        --openai.base_url http://localhost:8001/v1 \\
        --env.group_size 8 \\
        --slurm false``
@@ -98,7 +98,7 @@ def main():
     # Trainer
     # ------------------------------------------------------------------
     trainer = AsyncAtroposGRPOTrainer(
-        model="Qwen/Qwen2.5-0.5B-Instruct",
+        model="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
         args=config,
         train_dataset=dataset,
         # No reward_funcs needed — scores come from Atropos environment.
