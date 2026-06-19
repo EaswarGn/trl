@@ -160,7 +160,7 @@ run-api
 One or more environment processes that generate and score trajectories. Each environment must be pointed at the vLLM server.
 
 ```bash
-python environments/gsm8k_server.py process \
+python environments/gsm8k_server.py serve \
   --openai.model_name deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
   --openai.base_url http://localhost:9001/v1 \
   --openai.server_type vllm_logprob \
