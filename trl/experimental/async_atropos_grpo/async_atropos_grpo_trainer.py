@@ -51,13 +51,15 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Dict, Optional, Union
 
-from datasets import Dataset, IterableDataset
+from datasets import Dataset
+import torch
 from transformers import PreTrainedTokenizerBase, TrainerCallback
+from .placeholders import _DummyIterableDataset, _passthrough_reward
 
 from trl.experimental.async_grpo import AsyncGRPOTrainer, AsyncGRPOConfig
-from trl.experimental.async_grpo.async_grpo_trainer import EnvironmentFactory, RewardFunc
+from trl.experimental.async_grpo.async_grpo_trainer import EnvironmentFactory, RewardFunc, RolloutWorkerProtocol
 from trl.experimental.async_grpo.weight_transfer import WeightTransferClient
 
 from .async_atropos_grpo_config import AsyncAtroposGRPOConfig
@@ -111,22 +113,14 @@ class AsyncAtroposGRPOTrainer(AsyncGRPOTrainer):
 
     def __init__(
         self,
-        model: str,
-        reward_funcs: RewardFunc | list[RewardFunc] | None = None,
+        model_name: str,
         args: AsyncAtroposGRPOConfig | None = None,
-        train_dataset: Dataset | IterableDataset | None = None,
-        processing_class: PreTrainedTokenizerBase | None = None,
         callbacks: list[TrainerCallback] | None = None,
-        optimizers: tuple[Any, Any] | None = None,
-        tools: list[Callable] | None = None,
-        environment_factory: EnvironmentFactory | None = None,
-        # Allow injecting a custom rollout worker (e.g. for testing)
-        rollout_worker=None,
+        optimizers: tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None),
         **kwargs,
     ):
         # Default config
         if args is None:
-            model_name = model if isinstance(model, str) else model.config._name_or_path
             args = AsyncAtroposGRPOConfig(
                 output_dir=f"{model_name.split('/')[-1]}-async-atropos-grpo",
             )
@@ -137,87 +131,55 @@ class AsyncAtroposGRPOTrainer(AsyncGRPOTrainer):
                 f"got {type(args).__name__}."
             )
 
-        # Create the AtroposRolloutWorker if no custom worker was injected.
-        # We pass it as rollout_worker to the parent so it skips creating
-        # a default AsyncRolloutWorker.
-        if rollout_worker is None:
-            rollout_worker = AtroposRolloutWorker(
-                atropos_api_url=args.atropos_api_url,
-                atropos_trainer_id=args.atropos_trainer_id,
-                group_size=args.atropos_group_size,
-                batch_timeout=args.atropos_batch_timeout,
-                poll_interval=args.atropos_poll_interval,
-                max_retries=args.atropos_max_retries,
-                max_inflight_batches=args.atropos_max_inflight_batches,
-                queue_maxsize=args.queue_maxsize,
-                log_completions=args.log_completions,
-                num_completions_to_print=args.num_completions_to_print,
-            )
+        rollout_worker: RolloutWorkerProtocol = AtroposRolloutWorker(
+            atropos_api_url=args.atropos_api_url,
+            group_size=args.atropos_group_size,
+            batch_timeout=args.atropos_batch_timeout,
+            poll_interval=args.atropos_poll_interval,
+            max_retries=args.atropos_max_retries,
+            queue_maxsize=args.queue_maxsize,
+            log_completions=args.log_completions,
+            num_completions_to_print=args.num_completions_to_print,
+            processing_class_name=model_name,
+        )
 
-        # Use pass-through reward funcs when none are given — Atropos provides
-        # the actual scores.
-        if reward_funcs is None:
-            def _passthrough_reward(**kw) -> list[float]:
-                prompts = kw.get("prompts", kw.get("prompt", None))
-                if prompts is not None:
-                    return [0.0] * len(prompts)
-                return []
-            reward_funcs = _passthrough_reward
+        # ``AsyncGRPOTrainer`` requires a non-None train_dataset, but the
+        # dummy placeholder is never actually consumed — the inherited
+        # ``get_train_dataloader`` returns a ``RolloutQueueDataset`` backed
+        # by the rollout worker's queue instead.
+        _passthrough_dataset = _DummyIterableDataset()
 
-        if not isinstance(reward_funcs, list):
-            reward_funcs = [reward_funcs]
-
-        # Store config for later use
-        self._atropos_args = args
-
-        # Delegates to AsyncGRPOTrainer.__init__.
-        # The parent loads the model and tokenizer.  When a custom
-        # rollout_worker is passed, the parent skips creating both
-        # WeightTransferClient and AsyncRolloutWorker — it just stores
-        # rollout_worker and sets weight_transfer = None.
-        # We fix weight_transfer after the call.
         super().__init__(
-            model=model,
-            reward_funcs=reward_funcs,
+            model=model_name,
+            reward_funcs=_passthrough_reward,
             args=args,
-            train_dataset=train_dataset,
-            processing_class=processing_class,
+            train_dataset=_passthrough_dataset,
             callbacks=callbacks,
             optimizers=optimizers,
-            tools=tools,
-            environment_factory=environment_factory,
             rollout_worker=rollout_worker,
             **kwargs,
         )
 
-        # ------------------------------------------------------------------ #
-        # FIX: Create WeightTransferClient if the parent skipped it
-        # ------------------------------------------------------------------ #
-        # When a custom rollout_worker is passed, AsyncGRPOTrainer.__init__
-        # sets self.weight_transfer = None.  We need weight transfer to push
-        # model updates to the vLLM server so the Atropos environments
-        # generate from the latest policy.  Create it now.
-        if self.weight_transfer is None and self.accelerator.is_main_process:
-            self._init_weight_transfer_for_atropos()
+        if self.accelerator.is_main_process:
+            self.weight_transfer = self._init_weight_transfer_client()
+        else:
+            self.weight_transfer = None
 
         # Registration state
         self._atropos_registered = False
+        self.atropos_configs = args
 
-    def _init_weight_transfer_for_atropos(self) -> None:
-        """Create WeightTransferClient for pushing weights to the vLLM server.
-
-        This replicates the weight metadata collection that the parent does
-        in its default path (when no custom rollout_worker is given).
-        """
+    def _init_weight_transfer_client(self) -> WeightTransferClient:
+        """Collect weight metadata from the loaded model and create a WeightTransferClient."""
         weight_names, weight_dtype_names, weight_shapes = [], [], []
         for name, param in self.model.named_parameters():
-            # DDP/FSDP1 wrapping — strip "module." prefix if present
+            # DDP/FSDP1 wrapping, avoids vllm module not exist error
             name = name.removeprefix("module.")
             weight_names.append(name)
             weight_dtype_names.append(str(param.dtype).split(".")[-1])
             weight_shapes.append(list(param.shape))
 
-        self.weight_transfer = WeightTransferClient(
+        return WeightTransferClient(
             vllm_server_url=self.args.vllm_server_base_url,
             server_timeout=self.args.vllm_server_timeout,
             weight_update_info={
@@ -228,62 +190,98 @@ class AsyncAtroposGRPOTrainer(AsyncGRPOTrainer):
                 "is_checkpoint_format": True,
             },
         )
-        logger.info(
-            "Created WeightTransferClient for vLLM server at %s",
-            self.args.vllm_server_base_url,
-        )
 
     # ------------------------------------------------------------------ #
     # Atropos registration                                                 #
     # ------------------------------------------------------------------ #
-
-    def _ensure_registered(self) -> None:
+    def register_with_atropos(self) -> None:
         """Register with the Atropos API server exactly once."""
         if self._atropos_registered:
             return
-        # The child process (AtroposRolloutWorker) handles actual registration.
-        # We do a lightweight health check here to fail fast if the API server
-        # is unreachable — before spawning the child.
-        if not self.accelerator.is_main_process:
-            self._atropos_registered = True
-            return
+
+        url = f"{self.atropos_configs.atropos_api_url}/register"
+        payload = {
+            # wandb fields are required strings - use empty string if None
+            "wandb_group": self.atropos_configs.atropos_env_wandb_group or "",
+            "wandb_project": self.atropos_configs.atropos_env_wandb_project or "",
+            "batch_size": self.atropos_configs.per_device_train_batch_size,
+            "max_token_len": self.atropos_configs.atropos_max_tokens,
+            "starting_step": self.state.global_step,
+            "checkpoint_dir": self.atropos_configs.output_dir,
+            "save_checkpoint_interval": self.atropos_configs.save_steps * self.atropos_configs.gradient_accumulation_steps,
+            "num_steps": self.atropos_configs.max_steps * self.atropos_configs.gradient_accumulation_steps,
+        }
 
         import requests
-        try:
-            resp = requests.get(f"{self._atropos_args.atropos_api_url}/", timeout=5.0)
-            if resp.status_code >= 500:
-                raise ConnectionError(
-                    f"Atropos API at {self._atropos_args.atropos_api_url} returned "
-                    f"status {resp.status_code}."
+        from requests.models import Response
+        import time
+        for attempt in range(self.atropos_configs.atropos_max_retries):
+            try:
+                resp: Response = requests.post(url, json=payload, timeout=30.0)
+                resp.raise_for_status()
+                logger.info("Registered with Atropos API at %s", self.atropos_configs.atropos_api_url)
+                self._atropos_registered = True
+                return
+            except requests.RequestException as exc:
+                if attempt == self.atropos_configs.atropos_max_retries - 1:
+                    raise ConnectionError(
+                        f"Cannot register with Atropos API at {self.atropos_configs.atropos_api_url} "
+                        f"after {self.atropos_configs.atropos_max_retries} attempts: {exc}"
+                    ) from exc
+                logger.warning(
+                    "Registration attempt %d/%d failed: %s – retrying in 2s",
+                    attempt + 1,
+                    self.atropos_configs.atropos_max_retries,
+                    exc,
                 )
-            logger.info(
-                "Atropos API at %s is reachable",
-                self._atropos_args.atropos_api_url,
-            )
-        except requests.ConnectionError as e:
-            raise ConnectionError(
-                f"Cannot reach Atropos API at {self._atropos_args.atropos_api_url}. "
-                "Ensure `run-api` is running before starting the trainer."
-            ) from e
-
-        self._atropos_registered = True
+                time.sleep(2.0)
 
     # ------------------------------------------------------------------ #
-    # train() override                                                      #
+    # _inner_training_loop() override
     # ------------------------------------------------------------------ #
 
-    def train(self, *args, **kwargs):
+    def _inner_training_loop(self, *args, **kwargs):
         """Register with Atropos, then start the async training loop."""
         # Only register on the main process
         if self.accelerator.is_main_process:
-            self._ensure_registered()
+            self.register_with_atropos()
 
         # Barrier so all processes wait for registration before proceeding
         self.accelerator.wait_for_everyone()
 
-        try:
-            return super().train(*args, **kwargs)
-        finally:
-            # Clean shutdown — the parent's _inner_training_loop handles
-            # rollout_worker.stop() and weight_transfer.destroy().
-            pass
+        return super()._inner_training_loop(*args, **kwargs)
+
+    # ------------------------------------------------------------------ #
+    # Evaluation override
+    # ------------------------------------------------------------------ #
+
+    def evaluate(
+        self,
+        eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
+        ignore_keys: Optional[list[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+        """
+        Override evaluate method to prevent actual evaluation from running.
+
+        In AsyncAtroposGRPOTrainer, evaluation is handled by the Atropos environment,
+        not by the trainer itself. This method logs that information and returns
+        an empty metrics dictionary without running any evaluation.
+        """
+        import inspect
+        logger.info(
+            inspect.cleandoc(
+                """
+                AsyncAtroposGRPOTrainer does not run evaluation - the Atropos environment
+                is responsible for evaluation. Returning empty metrics.
+
+                You can also run evaluation separately on your env with the command below:
+                python <your_environment>.py evaluate \\
+                --openai.base_url <openai_url> \\
+                --openai.api_key <api_key> \\
+                --openai.model_name <model_id>
+                """
+            )
+        )
+        # Return empty metrics dictionary matching the expected return type
+        return {}

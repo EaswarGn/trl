@@ -28,10 +28,10 @@ The worker lives in a CUDA-free child process (spawned via ``multiprocessing``)
 and communicates with the parent trainer through a shared ``mp.Queue``
 (``rollout_buffer``).  The child process:
 
-1. Registers with the Atropos API server (POST /register).
-2. Polls the API server (GET /batch) for scored trajectory groups.
-3. Flattens each group into individual ``RolloutSample`` instances.
-4. Computes group-relative GRPO advantages.
+1. Polls the Atropos API server (GET /batch) for scored trajectory groups.
+2. Flattens each group into individual ``RolloutSample`` instances.
+3. Decodes prompt and completion text via the tokenizer.
+4. Computes group-relative GRPO advantages and detailed rollout metrics.
 5. Pushes the samples onto the shared queue.
 
 Data-flow
@@ -53,10 +53,11 @@ from collections import Counter
 from multiprocessing.queues import Queue as MPQueue
 from multiprocessing.sharedctypes import Synchronized as MPValue
 from multiprocessing.synchronize import Event as MPEvent
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import requests
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from trl.experimental.async_grpo.async_rollout_worker import RolloutSample
 from trl.trainer.utils import print_prompt_completions_sample
@@ -111,7 +112,7 @@ def _child_main(
 ) -> None:
     """Entry point for the spawned child process.
 
-    Scrub the environment, initialise the asyncio-free polling loop, and
+    Scrub the environment, initialise the polling loop, and
     signal readiness to the parent.  Any unhandled exception is forwarded
     to the parent via ``failed_event`` + ``exception_info_queue``.
     """
@@ -146,7 +147,7 @@ def _child_main(
 class _AtroposPollingLoop:
     """Synchronous polling loop that runs inside the child process.
 
-    Owns the HTTP session, dataset iterator, and the loop control state.
+    Owns the HTTP session, the tokenizer, and the loop control state.
     Talks to the Atropos API via ``requests``.  Pushes scored
     ``RolloutSample`` instances into the shared ``mp.Queue``.
     """
@@ -155,12 +156,10 @@ class _AtroposPollingLoop:
         self,
         *,
         atropos_api_url: str,
-        atropos_trainer_id: str,
         group_size: int,
         batch_timeout: float,
         poll_interval: float,
         max_retries: int,
-        max_inflight_batches: int,
         log_completions: bool,
         num_completions_to_print: int,
         rollout_buffer: MPQueue,
@@ -169,14 +168,13 @@ class _AtroposPollingLoop:
         heartbeat_value: MPValue,
         failed_event: MPEvent,
         exception_info_queue: MPQueue,
+        processing_class_name: str | None = None,
     ):
         self.atropos_api_url = atropos_api_url.rstrip("/")
-        self.atropos_trainer_id = atropos_trainer_id
         self.group_size = group_size
         self.batch_timeout = batch_timeout
         self.poll_interval = poll_interval
         self.max_retries = max_retries
-        self.max_inflight_batches = max_inflight_batches
         self.log_completions = log_completions
         self.num_completions_to_print = num_completions_to_print
 
@@ -187,10 +185,34 @@ class _AtroposPollingLoop:
         self._failed_event = failed_event
         self._exception_info_queue = exception_info_queue
 
+        # ------------------------------------------------------------------ #
+        # Tokenizer: loaded in child so prompt/completion text can be decoded.
+        # ``processing_class_name`` is a plain str (picklable), never a
+        # tokenizer object.  We load the tokenizer here in the child, avoiding
+        # any torch/tokenizers CUDA initialisation in the parent.
+        # ------------------------------------------------------------------ #
+        self.tokenizer: Optional[PreTrainedTokenizerBase]  = None
+        if processing_class_name is not None:
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(processing_class_name)
+                logger.info(
+                    "Loaded tokenizer '%s' for prompt/completion text decoding.",
+                    processing_class_name,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load tokenizer '%s': %s. "
+                    "RolloutSample.prompt/completion will be empty lists.",
+                    processing_class_name,
+                    exc,
+                )
+
         # State
         self._session: requests.Session | None = None
-        self._registered = False
         self._total_groups_processed = 0
+        # Timing accumulators for detailed metrics
+        self._generation_start_time: float | None = None
+        self._total_completion_tokens = 0
 
     @property
     def model_version(self) -> int:
@@ -214,74 +236,21 @@ class _AtroposPollingLoop:
                 self._session.close()
 
     # ------------------------------------------------------------------
-    # Registration
-    # ------------------------------------------------------------------
-
-    def _ensure_registered(self) -> None:
-        if self._registered:
-            return
-        url = f"{self.atropos_api_url}/register"
-        payload = {
-            "trainer_id": self.atropos_trainer_id,
-            "batch_size": self.max_inflight_batches,
-            "group_size": self.group_size,
-        }
-        for attempt in range(self.max_retries):
-            try:
-                resp = self._session.post(url, json=payload, timeout=30.0)
-                resp.raise_for_status()
-                logger.info("Registered with Atropos API at %s", self.atropos_api_url)
-                self._registered = True
-                return
-            except requests.RequestException as exc:
-                if attempt == self.max_retries - 1:
-                    raise ConnectionError(
-                        f"Cannot register with Atropos API at {self.atropos_api_url} "
-                        f"after {self.max_retries} attempts: {exc}"
-                    ) from exc
-                logger.warning(
-                    "Registration attempt %d/%d failed: %s – retrying in 2s",
-                    attempt + 1,
-                    self.max_retries,
-                    exc,
-                )
-                time.sleep(2.0)
-
-    # ------------------------------------------------------------------
-    # Health check helpers
-    # ------------------------------------------------------------------
-
-    def _check_api_health(self) -> bool:
-        """Return True if the Atropos API server is reachable."""
-        try:
-            resp = self._session.get(f"{self.atropos_api_url}/", timeout=5.0)
-            return resp.status_code < 500
-        except requests.RequestException:
-            return False
-
-    def _wait_for_api_healthy(self, timeout: float = 60.0) -> None:
-        """Block until the API server is reachable or timeout elapses."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self._check_api_health():
-                logger.info("Atropos API at %s is healthy", self.atropos_api_url)
-                return
-            logger.info("Waiting for Atropos API at %s ...", self.atropos_api_url)
-            time.sleep(2.0)
-        raise ConnectionError(
-            f"Atropos API at {self.atropos_api_url} not reachable within {timeout}s."
-        )
-
-    # ------------------------------------------------------------------
     # Batch fetching
     # ------------------------------------------------------------------
 
-    def _fetch_batch(self) -> list[dict[str, Any]] | None:
-        """Poll /batch once.  Returns the list of group dicts or None."""
+    def _fetch_batch(self, session: requests.Session | None = None) -> list[dict[str, Any]] | None:
+        """Poll /batch once.  Returns the list of group dicts or None.
+
+        ``session`` is optional and, when provided, is used instead of
+        ``self._session``.  This keeps the shared session free of concurrent
+        access from the thread-pool executor workers.
+        """
+        sess = session if session is not None else self._session
         url = f"{self.atropos_api_url}/batch"
         for attempt in range(self.max_retries):
             try:
-                resp = self._session.get(url, timeout=30.0)
+                resp = sess.get(url, timeout=30.0)
             except requests.RequestException as exc:
                 if attempt == self.max_retries - 1:
                     return None
@@ -314,20 +283,55 @@ class _AtroposPollingLoop:
     def _wait_for_batch(self) -> list[dict[str, Any]]:
         """Block until a batch is available, polling every ``poll_interval``.
 
-        Checks the stop event periodically so the loop exits promptly on shutdown.
+        Each thread gets its own ``requests.Session`` so that concurrent
+        HTTP calls from the thread-pool executor are safe.
         """
-        deadline = time.monotonic() + self.batch_timeout
-        while time.monotonic() < deadline:
-            if self._stop_event.is_set():
-                raise RuntimeError("Stop event set while waiting for batch.")
-            batch = self._fetch_batch()
-            if batch is not None and len(batch) > 0:
-                return batch
-            time.sleep(self.poll_interval)
+        with requests.Session() as session:
+            deadline = time.monotonic() + self.batch_timeout
+            while time.monotonic() < deadline:
+                if self._stop_event.is_set():
+                    raise RuntimeError("Stop event set while waiting for batch.")
+                batch = self._fetch_batch(session)
+                if batch is not None and len(batch) > 0:
+                    return batch
+                time.sleep(self.poll_interval)
         raise TimeoutError(
             f"No batch available from Atropos API at {self.atropos_api_url} "
             f"within {self.batch_timeout}s."
         )
+
+    # ------------------------------------------------------------------
+    # Metrics computation
+    # ------------------------------------------------------------------
+
+    def _compute_rollout_metrics(
+        self,
+        samples: list[RolloutSample],
+        conversion_time_s: float,
+        buffer_wait_time_s: float,
+    ) -> None:
+        """Attach extra per-sample metrics to every ``RolloutSample`` in-place.
+
+        Additional metrics beyond ``async_grpo``:
+            - ``conversion_time_ms``: wall-clock time to convert the raw batch
+              into ``RolloutSample`` objects (split prompt/completion, compute
+              advantages, decode text).
+            - ``buffer_wait_time_s``: time spent retrying ``put_nowait`` on the
+              mp.Queue when it was full.
+            - ``generation_tok_per_s``: rolling throughput since this child
+              process started.
+            - ``buffer_qsize``: number of items in rollout buffer.
+        """
+        assert self._generation_start_time is not None
+        elapsed = time.monotonic() - self._generation_start_time
+        generation_tok_per_sec = self._total_completion_tokens / elapsed if elapsed > 0 else 0.0
+        buffer_qsize = self.rollout_buffer.qsize()
+
+        for sample in samples:
+            sample.metrics["conversion_time_ms"] = conversion_time_s * 1000
+            sample.metrics["buffer_wait_time_s"] = buffer_wait_time_s
+            sample.metrics["generation_tok_per_s"] = generation_tok_per_sec
+            sample.metrics["buffer_qsize"] = buffer_qsize
 
     # ------------------------------------------------------------------
     # Batch conversion: Atropos group dicts → RolloutSample list
@@ -337,8 +341,10 @@ class _AtroposPollingLoop:
         """Convert a list of Atropos group dicts to individual ``RolloutSample``s.
 
         Each group dict contains parallel lists of sequences (tokens, masks,
-        inference_logprobs, scores).  This method flattens the groups and
-        applies group-relative GRPO advantage normalisation.
+        inference_logprobs, scores).  This method flattens the groups,
+        splits tokens into prompt and completion parts, decodes them to text
+        using the tokenizer, and applies group-relative GRPO advantage
+        normalisation.
 
         Atropos batch contract (from /batch endpoint)
         ----------------------------------------------
@@ -377,7 +383,11 @@ class _AtroposPollingLoop:
             env_id_counter[env_id_str] += len(tokens_list)
 
             seq_count = len(tokens_list)
-            if not (len(masks_list) == seq_count and len(logprobs_list) == seq_count and len(scores_list) == seq_count):
+            if not (
+                len(masks_list) == seq_count
+                and len(logprobs_list) == seq_count
+                and len(scores_list) == seq_count
+            ):
                 raise ValueError(
                     f"Atropos batch group {group_idx} has mismatched sequence counts: "
                     f"tokens={seq_count}, masks={len(masks_list)}, "
@@ -385,12 +395,14 @@ class _AtroposPollingLoop:
                 )
 
             for seq_idx in range(seq_count):
-                trajectories.append({
-                    "tokens": tokens_list[seq_idx],
-                    "masks": masks_list[seq_idx],
-                    "logprobs": logprobs_list[seq_idx],
-                    "score": scores_list[seq_idx],
-                })
+                trajectories.append(
+                    {
+                        "tokens": tokens_list[seq_idx],
+                        "masks": masks_list[seq_idx],
+                        "logprobs": logprobs_list[seq_idx],
+                        "score": scores_list[seq_idx],
+                    }
+                )
 
         if len(env_id_counter) > 1:
             logger.info(
@@ -411,13 +423,16 @@ class _AtroposPollingLoop:
             )
 
         # ------------------------------------------------------------------
-        # Split tokens into prompt / completion parts
+        # Split tokens into prompt / completion parts and decode to text
         # ------------------------------------------------------------------
-        completion_ids_list: list[list[int]] = []
         completion_logps_list: list[list[float]] = []
         scores_list: list[float] = []
         full_ids_list: list[list[int]] = []
         completion_mask_list: list[list[int]] = []
+        prompt_texts: list[str] = []
+        completion_texts: list[str] = []
+        prompt_ids_list: list[list[int]] = []
+        completion_ids_list_decoded: list[list[int]] = []
 
         for traj in trajectories:
             tokens: list[int] = traj["tokens"]
@@ -436,12 +451,15 @@ class _AtroposPollingLoop:
                 len(tokens),
             )
 
+            prompt_ids = tokens[:completion_start]
+            comp_ids = tokens[completion_start:]
+
             full_ids_list.append(tokens)
             completion_mask_list.append(
                 [0] * completion_start + [1] * (len(tokens) - completion_start)
             )
-
-            completion_ids_list.append(tokens[completion_start:])
+            prompt_ids_list.append(prompt_ids)
+            completion_ids_list_decoded.append(comp_ids)
 
             # Replace sentinel 0.0 logprobs (meaning "not provided") with -100.0
             # so they don't bias the importance-sampling ratio.
@@ -451,6 +469,21 @@ class _AtroposPollingLoop:
             )
 
             scores_list.append(float(traj["score"]))
+
+            # Decode prompt and completion text using the tokenizer.
+            # If no tokenizer is available, fall back to empty strings.
+            if self.tokenizer is not None:
+                try:
+                    prompt_texts.append(self.tokenizer.decode(prompt_ids, skip_special_tokens=False))
+                except Exception:
+                    prompt_texts.append("")
+                try:
+                    completion_texts.append(self.tokenizer.decode(comp_ids, skip_special_tokens=False))
+                except Exception:
+                    completion_texts.append("")
+            else:
+                prompt_texts.append("")
+                completion_texts.append("")
 
         # ------------------------------------------------------------------
         # GRPO advantage computation (group-relative normalization)
@@ -469,7 +502,8 @@ class _AtroposPollingLoop:
         # Build RolloutSample list
         # ------------------------------------------------------------------
         samples: list[RolloutSample] = []
-        # Log metadata
+
+        # Log batch-level metadata
         logger.info(
             "Scored batch: %d trajectories in %d groups, "
             "reward_mean=%.4f, reward_std=%.4f",
@@ -480,16 +514,22 @@ class _AtroposPollingLoop:
         )
 
         for i in range(num_trajectories):
+            # Build old_log_probs: pad with zeros for prompt positions, then
+            # append completion logprobs.
+            prompt_len = (
+                completion_mask_list[i].index(1)
+                if 1 in completion_mask_list[i]
+                else len(completion_mask_list[i])
+            )
+            old_log_probs_list = [0.0] * prompt_len + completion_logps_list[i]
+
             samples.append(
                 RolloutSample(
-                    prompt=[],  # not used by the loss; kept for logging
-                    completion=[],  # not used by the loss; kept for logging
+                    prompt=prompt_texts[i],          # decoded prompt text
+                    completion=completion_texts[i],  # decoded completion text
                     input_ids=full_ids_list[i],
                     completion_mask=completion_mask_list[i],
-                    old_log_probs=[0.0] * (
-                        completion_mask_list[i].index(1) if 1 in completion_mask_list[i]
-                        else 0
-                    ) + completion_logps_list[i],
+                    old_log_probs=old_log_probs_list,
                     advantage=float(advantages[i]),
                     model_version=self.model_version,
                     metrics={
@@ -500,16 +540,6 @@ class _AtroposPollingLoop:
                 )
             )
 
-        if self.log_completions and samples:
-            print_prompt_completions_sample(
-                prompts=[s.prompt for s in samples],
-                completions=[s.completion for s in samples],
-                rewards={"reward": [s.metrics["reward"] for s in samples]},
-                advantages=[s.advantage for s in samples],
-                step=self._total_groups_processed,
-                num_samples=self.num_completions_to_print,
-            )
-
         return samples
 
     # ------------------------------------------------------------------
@@ -517,43 +547,122 @@ class _AtroposPollingLoop:
     # ------------------------------------------------------------------
 
     def _poll_loop(self) -> None:
-        """Main polling loop: register, then fetch & push batches forever."""
-        self._wait_for_api_healthy(timeout=60.0)
-        self._ensure_registered()
+        """Main polling loop: fetch & push batches."""
 
-        while not self._stop_event.is_set():
-            # Update heartbeat for parent health checks
-            self._heartbeat_value.value = time.time()
+        # Prime the generation-start clock so that throughput can be measured
+        # from the first successful conversion, not from arbitrary process start.
+        self._generation_start_time = None
 
-            # Wait for a scored batch from the API server
-            raw_batch = self._wait_for_batch()
+        buffer_total_wait_s = 0.0  # rolling total for logging
 
-            # Convert to RolloutSample objects
-            samples = self._convert_batch(raw_batch)
+        try:
+            while not self._stop_event.is_set():
+                self._heartbeat_value.value = time.time()
 
-            # Push each sample onto the shared queue
-            for sample in samples:
-                while True:
-                    try:
-                        self.rollout_buffer.put_nowait(sample)
+                try:
+                    raw_batch = self._wait_for_batch()
+                except RuntimeError as exc:
+                    if "Stop event set" in str(exc):
                         break
-                    except queue.Full:
-                        logger.info(
-                            "Rollout buffer full (qsize=%d), waiting for trainer to consume...",
-                            self.rollout_buffer.qsize(),
-                        )
-                        time.sleep(0.5)
+                    logger.warning("Batch fetch failed: %s", exc)
+                    raw_batch = None
+                except Exception as exc:
+                    logger.warning("Batch fetch failed: %s", exc)
+                    raw_batch = None
 
-            # Heartbeat – signal liveness so the parent knows we're still alive
-            self._heartbeat_value.value = time.time()
-            self._total_groups_processed += 1
+                if not raw_batch:
+                    continue
 
-            if self._total_groups_processed % 10 == 0:
-                logger.info(
-                    "Processed %d batches, buffer_qsize=%d",
-                    self._total_groups_processed,
-                    self.rollout_buffer.qsize(),
+                # Initialise the generation clock on the first real batch
+                if self._generation_start_time is None:
+                    self._generation_start_time = time.monotonic()
+
+                # Time the batch conversion phase
+                t_convert_start = time.monotonic()
+                samples = self._convert_batch(raw_batch)
+                conversion_time_s = time.monotonic() - t_convert_start
+
+                # Count completion tokens for throughput measurement
+                for s in samples:
+                    self._total_completion_tokens += sum(s.completion_mask)
+
+                # Push each sample onto the shared queue, tracking queue-wait time
+                t_buffer_start = time.monotonic()
+                buffer_wait_time_s = 0.0
+                for sample in samples:
+                    while True:
+                        try:
+                            self.rollout_buffer.put_nowait(sample)
+                            break
+                        except queue.Full:
+                            block_start = time.monotonic()
+                            logger.info(
+                                "Rollout buffer full (qsize=%d), waiting for trainer to consume...",
+                                self.rollout_buffer.qsize(),
+                            )
+                            time.sleep(0.5)
+                            buffer_total_wait_s += (time.monotonic() - block_start)
+                buffer_wait_time_s = time.monotonic() - t_buffer_start
+
+                # Attach rollout metrics to each sample before the trainer consumes them
+                self._compute_rollout_metrics(samples, conversion_time_s, buffer_wait_time_s)
+
+                # Optionally print a human-readable prompt/completion sample
+                if self.log_completions and samples:
+                    print_prompt_completions_sample(
+                        prompts=[s.prompt for s in samples],
+                        completions=[s.completion for s in samples],
+                        rewards={"reward": [s.metrics["reward"] for s in samples]},
+                        advantages=[s.advantage for s in samples],
+                        step=self._total_groups_processed,
+                        num_samples=self.num_completions_to_print,
+                    )
+
+                # Heartbeat – signal liveness so the parent knows we're still alive
+                self._heartbeat_value.value = time.time()
+                self._total_groups_processed += 1
+
+                # Detailed per-batch log line
+                elapsed_s = time.monotonic() - (
+                    self._generation_start_time or time.monotonic()
                 )
+                tok_per_sec = (
+                    self._total_completion_tokens / elapsed_s if elapsed_s > 0 else 0.0
+                )
+                group_size_denom = (
+                    self.group_size if getattr(self, "group_size", 0) > 0 else 1
+                )
+                num_groups = len(samples) // group_size_denom
+                logger.info(
+                    "Processed batch %d: %d samples in %d groups, "
+                    "conversion=%.1fms, buffer_wait=%.1fs, "
+                    "completion_tok_per_s=%.1f, total_completion_tokens=%d, "
+                    "buffer_qsize=%d, reward_mean=%.4f, reward_std=%.4f",
+                    self._total_groups_processed,
+                    len(samples),
+                    num_groups,
+                    conversion_time_s * 1000,
+                    buffer_wait_time_s,
+                    tok_per_sec,
+                    self._total_completion_tokens,
+                    self.rollout_buffer.qsize(),
+                    samples[0].metrics["reward_mean"] if samples else 0.0,
+                    samples[0].metrics["reward_std"] if samples else 0.0,
+                )
+
+                # Periodic summary every 10 batches
+                if self._total_groups_processed % 10 == 0:
+                    logger.info(
+                        "[summary] batches_processed=%d, "
+                        "total_completion_tokens=%d, avg_tok_per_s=%.1f, "
+                        "total_buffer_wait_s=%.1fs",
+                        self._total_groups_processed,
+                        self._total_completion_tokens,
+                        tok_per_sec,
+                        buffer_total_wait_s,
+                    )
+        finally:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -582,16 +691,15 @@ class AtroposRolloutWorker:
         self,
         *,
         atropos_api_url: str = "http://localhost:8000",
-        atropos_trainer_id: str = "trl_async_atropos",
         group_size: int = 8,
         batch_timeout: float = 300.0,
         poll_interval: float = 1.0,
         max_retries: int = 3,
-        max_inflight_batches: int = 2,
         queue_maxsize: int = 0,
         child_ready_timeout: int = 300,
         log_completions: bool = False,
         num_completions_to_print: int = 3,
+        processing_class_name: str | None = None,
     ):
         ctx = mp.get_context("spawn")
         self._mp_ctx = ctx
@@ -605,14 +713,13 @@ class AtroposRolloutWorker:
 
         self._worker_kwargs = {
             "atropos_api_url": atropos_api_url,
-            "atropos_trainer_id": atropos_trainer_id,
             "group_size": group_size,
             "batch_timeout": batch_timeout,
             "poll_interval": poll_interval,
             "max_retries": max_retries,
-            "max_inflight_batches": max_inflight_batches,
             "log_completions": log_completions,
             "num_completions_to_print": num_completions_to_print,
+            "processing_class_name": processing_class_name,
         }
         self._child_ready_timeout = child_ready_timeout
         self._process: mp.Process | None = None
@@ -637,7 +744,9 @@ class AtroposRolloutWorker:
     def start(self) -> None:
         """Spawn the child process and wait for it to signal readiness."""
         if self._process is not None:
-            logger.warning("AtroposRolloutWorker.start() called but child is already running; ignoring.")
+            logger.warning(
+                "AtroposRolloutWorker.start() called but child is already running; ignoring."
+            )
             return
 
         self._heartbeat_value.value = time.time()
