@@ -103,6 +103,13 @@ class WeightTransferClient:
         if self.model_update_group is None:
             return
         t0 = time.time()
+        
+        requests.post(
+            f"{self.vllm_server_url}/start_weight_update", 
+            json={"is_checkpoint_format": False}
+        )
+        logger.debug(f"[weight_sync] /start_weight_update POST sent")
+        
         t_update = threading.Thread(
             target=requests.post,
             args=(f"{self.vllm_server_url}/update_weights",),
@@ -122,6 +129,9 @@ class WeightTransferClient:
             f"[weight_sync] /update_weights join took {time.time() - t_join:.1f}s "
             f"(total send_weights: {time.time() - t0:.1f}s)"
         )
+        
+        requests.post(f"{self.vllm_server_url}/finish_weight_update")
+        logger.debug(f"[weight_sync] /finish_weight_update POST sent")
 
     def pause(self) -> None:
         t0 = time.time()
