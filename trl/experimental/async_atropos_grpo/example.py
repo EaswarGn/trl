@@ -11,7 +11,8 @@ have the following services running:
        deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \\
        --max-model-len 4096 \\
        --logprobs-mode processed_logprobs \\
-       --weight-transfer-config '{"backend":"nccl"}'``
+       --weight-transfer-config '{"backend":"nccl"}' \\
+       --port 9001``
 
 2. **Atropos API server** (buffers scored trajectories):
    ``run-api``  (default port 8000)
@@ -19,7 +20,7 @@ have the following services running:
 3. **Atropos environment** (generates and scores trajectories):
    ``python atropos/environments/gsm8k_server.py serve \\
        --openai.model_name deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \\
-       --openai.base_url http://localhost:8001/v1 \\
+       --openai.base_url http://localhost:9001/v1 \\
        --env.group_size 8 \\
        --slurm false``
 
@@ -34,8 +35,6 @@ Multi-GPU (with accelerate)::
     accelerate launch --num_processes 4 \\
         trl/trl/experimental/async_atropos_grpo/example.py
 """
-
-from datasets import load_dataset
 from trl.experimental.async_atropos_grpo import (
     AsyncAtroposGRPOTrainer,
     AsyncAtroposGRPOConfig,
@@ -51,19 +50,17 @@ def main():
         # --- Atropos API settings ---
         atropos_api_url="http://localhost:8000",
         atropos_group_size=8,
-        atropos_trainer_id="trl_async_atropos",
         atropos_batch_timeout=300.0,
         atropos_poll_interval=1.0,
         atropos_max_retries=3,
-        atropos_max_inflight_batches=2,
+        atropos_max_tokens=4096,
         # --- vLLM server (vanilla vLLM with VLLM_SERVER_DEV_MODE=1) ---
         vllm_server_base_url="http://localhost:9001",
         vllm_server_timeout=240.0,
         weight_sync_steps=1,
         # --- Training hyperparameters ---
-        per_device_train_batch_size=4,
+        per_device_train_batch_size=8,
         num_generations=8,
-        max_completion_length=2048,
         temperature=1.0,
         epsilon=0.2,
         epsilon_high=0.28,
@@ -75,33 +72,22 @@ def main():
         bf16=True,
         gradient_checkpointing=True,
         # --- Async rollout pipeline ---
-        max_inflight_tasks=-1,  # auto-compute
+        #max_inflight_tasks=-1,  # auto-compute
         max_staleness=4,
         queue_maxsize=1024,
         heartbeat_stale_after_s=300.0,
         # --- Logging ---
         log_completions=True,
         num_completions_to_print=3,
-        report_to="none",
+        report_to="wandb",
     )
-
-    # ------------------------------------------------------------------
-    # Dataset
-    # ------------------------------------------------------------------
-    # The Atropos environment (e.g. gsm8k_server.py) samples prompts from
-    # its own dataset.  The trainer still needs a dataset for the dataloader
-    # contract, but it is ignored during training (rollouts come from Atropos).
-    dataset = load_dataset("trl-lib/DeepMath-103K", split="train", streaming=True)
 
     # ------------------------------------------------------------------
     # Trainer
     # ------------------------------------------------------------------
     trainer = AsyncAtroposGRPOTrainer(
-        model="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        model_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
         args=config,
-        train_dataset=dataset,
-        # No reward_funcs needed — scores come from Atropos environment.
-        # The trainer will use a pass-through that returns all zeros.
     )
 
     # ------------------------------------------------------------------
