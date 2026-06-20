@@ -33,9 +33,6 @@ class AsyncAtroposGRPOConfig(AsyncGRPOConfig):
     atropos_group_size (`int`, *optional*, defaults to `8`):
         Number of completions per prompt group. Must match the `group_size`
         configured in the Atropos environment.
-    atropos_trainer_id (`str`, *optional*, defaults to `"trl_async_atropos"`):
-        Identifier sent to the Atropos API during `/register`. Useful when
-        running multiple trainers against the same API.
     atropos_batch_timeout (`float`, *optional*, defaults to `300.0`):
         Seconds to wait for a batch from the Atropos API before raising
         `TimeoutError`. Increase this if your environment is slow to score.
@@ -44,10 +41,14 @@ class AsyncAtroposGRPOConfig(AsyncGRPOConfig):
     atropos_max_retries (`int`, *optional*, defaults to `3`):
         Number of HTTP retries on transient failures when polling the
         Atropos API.
-    atropos_max_inflight_batches (`int`, *optional*, defaults to `2`):
-        Maximum number of batches to fetch ahead and buffer locally in the
-        rollout worker. Larger values smooth over API latency but increase
-        the risk of stale policy data.
+    atropos_env_wandb_project (`str` or `None`, *optional*, defaults to `None`):
+        Name of wandb project to use for atropos env metrics, if enabled in env.
+    atropos_env_wandb_group (`str` or `None`, *optional*, defaults to `None`):
+        Name of wandb group to use for atropos env metrics.
+    atropos_max_tokens (`int`, *optional*, defaults to `2048`):
+        Maximum number of tokens to use for prompt and completion.
+        This value should be equal to the max prompt+completion tokens you expect.
+        Good place to start is `max_completion_length` * 2.
     """
 
     # Parameters that control the connection to Atropos
@@ -64,10 +65,6 @@ class AsyncAtroposGRPOConfig(AsyncGRPOConfig):
             )
         },
     )
-    atropos_trainer_id: str = field(
-        default="trl_async_atropos",
-        metadata={"help": "Identifier sent to the Atropos API on /register."},
-    )
     atropos_batch_timeout: float = field(
         default=300.0,
         metadata={"help": "Seconds to wait for a batch before raising TimeoutError."},
@@ -80,10 +77,23 @@ class AsyncAtroposGRPOConfig(AsyncGRPOConfig):
         default=3,
         metadata={"help": "Number of HTTP retries on transient failures."},
     )
-    atropos_max_inflight_batches: int = field(
-        default=2,
+    atropos_env_wandb_project: str | None = field(
+        default=None,
         metadata={
-            "help": "Maximum number of batches to fetch ahead and buffer locally. "
-            "Larger values smooth over API latency but increase the risk of stale policy data."
+            "help": "Name of wandb project to use for atropos env metrics, if enabled in env."
+        },
+    )
+    atropos_env_wandb_group: str | None = field(
+        default=None,
+        metadata={
+            "help": "Name of wandb group to use for atropos env metrics."
+        },
+    )
+    atropos_max_tokens: int = field(
+        default=2048,
+        metadata={
+            "help": "Maximum number of tokens to use for prompt and completion. "
+            "This value should be equal to the max prompt+completion tokens you expect. "
+            "Good place to start is `max_completion_length` * 2"
         },
     )
