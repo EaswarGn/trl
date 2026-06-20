@@ -159,6 +159,8 @@ class AsyncAtroposGRPOTrainer(AsyncGRPOTrainer):
             rollout_worker=rollout_worker,
             **kwargs,
         )
+        
+        self.atropos_configs = args
 
         if self.accelerator.is_main_process:
             self.weight_transfer = self._init_weight_transfer_client()
@@ -166,8 +168,7 @@ class AsyncAtroposGRPOTrainer(AsyncGRPOTrainer):
             self.weight_transfer = None
 
         # Registration state
-        self._atropos_registered = False
-        self.atropos_configs = args
+        self._atropos_registered = False        
 
     def _init_weight_transfer_client(self) -> WeightTransferClient:
         """Collect weight metadata from the loaded model and create a WeightTransferClient."""
@@ -180,14 +181,13 @@ class AsyncAtroposGRPOTrainer(AsyncGRPOTrainer):
             weight_shapes.append(list(param.shape))
 
         return WeightTransferClient(
-            vllm_server_url=self.args.vllm_server_base_url,
-            server_timeout=self.args.vllm_server_timeout,
+            vllm_server_url=self.atropos_configs.vllm_server_base_url,
+            server_timeout=self.atropos_configs.vllm_server_timeout,
             weight_update_info={
                 "names": weight_names,
                 "dtype_names": weight_dtype_names,
                 "shapes": weight_shapes,
                 "packed": True,
-                "is_checkpoint_format": True,
             },
         )
 
