@@ -465,7 +465,7 @@ class _AtroposPollingLoop:
             # so they don't bias the importance-sampling ratio.
             raw_lps = logprobs[completion_start:]
             completion_logps_list.append(
-                [lp if lp != 0.0 else -100.0 for lp in raw_lps]
+                [lp for lp in raw_lps]
             )
 
             scores_list.append(float(traj["score"]))
