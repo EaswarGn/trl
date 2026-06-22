@@ -734,6 +734,31 @@ class AsyncGRPOTrainer(_BaseTrainer):
             full = param.full_tensor() if isinstance(param, DTensor) else param.detach()
             if full.device != device:
                 full = full.to(device)
+                
+                            
+            # --- DEFENSIVE WEIGHT CHECKING ---
+            # We only need to crash/log on rank 0 (the process sending the weights),
+            # but checking is fast once full_tensor() is materialized.
+            if self.accelerator.is_main_process:
+                # torch.isfinite checks for both NaN and +/- Infinity
+                if not torch.isfinite(full).all():
+                    # Find exactly what's wrong for debugging
+                    has_nan = torch.isnan(full).any().item()
+                    has_inf = torch.isinf(full).any().item()
+                    
+                    error_msg = f"CRITICAL: Bad weights detected in parameter '{name}' before sync! "
+                    if has_nan: error_msg += "[Contains NaN] "
+                    if has_inf: error_msg += "[Contains Inf] "
+                    
+                    logger.error(error_msg)
+                    
+                    # Option A: Raise an exception to halt training before breaking vLLM
+                    raise ValueError(error_msg)
+                    
+                    # Option B: Safe fallback (uncomment if you'd rather skip or patch it)
+                    # full = torch.nan_to_num(full, nan=0.0, posinf=1e4, neginf=-1e4)
+            # ---------------------------------
+                
             yield name, full
 
     def _sync_weight(self):
