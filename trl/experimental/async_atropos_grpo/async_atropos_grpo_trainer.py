@@ -208,8 +208,8 @@ class AsyncAtroposGRPOTrainer(AsyncGRPOTrainer):
             "max_token_len": self.atropos_configs.atropos_max_tokens,
             "starting_step": self.state.global_step,
             "checkpoint_dir": self.atropos_configs.output_dir,
-            "save_checkpoint_interval": self.atropos_configs.save_steps * self.atropos_configs.gradient_accumulation_steps,
-            "num_steps": self.atropos_configs.max_steps * self.atropos_configs.gradient_accumulation_steps,
+            "save_checkpoint_interval": self.atropos_configs.save_steps,
+            "num_steps": self.atropos_configs.max_steps,
         }
 
         import requests
