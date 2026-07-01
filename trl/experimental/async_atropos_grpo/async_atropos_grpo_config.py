@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from dataclasses import dataclass, field
 
 from trl.experimental.async_grpo import AsyncGRPOConfig
@@ -49,6 +50,21 @@ class AsyncAtroposGRPOConfig(AsyncGRPOConfig):
         Maximum number of tokens to use for prompt and completion.
         This value should be equal to the max prompt+completion tokens you expect.
         Good place to start is `max_completion_length` * 2.
+
+    Ignored parameters (replaced by Atropos API)
+    --------------------------------------------
+    The following parameters are inherited from `AsyncGRPOConfig` but have **no effect**
+    in `AsyncAtroposGRPOTrainer` because the Atropos API handles generation and scoring:
+
+    - `num_generations`: Replaced by `atropos_group_size`
+    - `max_completion_length`: Replaced by `atropos_max_tokens`
+    - `temperature`: Controlled by the Atropos environment
+    - `chat_template_kwargs`: Atropos handles chat templating
+    - `max_tool_calling_iterations`: Atropos environment handles tool use
+    - `max_inflight_tasks`: Atropos polls batches, doesn't manage inflight tasks
+    - `request_timeout`: Only used for vLLM `/v1/completions` calls
+
+    If you explicitly set any of these, a warning will be raised.
     """
 
     # Parameters that control the connection to Atropos
@@ -97,3 +113,80 @@ class AsyncAtroposGRPOConfig(AsyncGRPOConfig):
             "Good place to start is `max_completion_length` * 2"
         },
     )
+
+    # Override unused AsyncGRPOConfig parameters with None defaults and deprecation warnings
+    # These are replaced by Atropos API / environment settings
+    num_generations: int | None = field(
+        default=None,
+        metadata={
+            "help": "IGNORED in AsyncAtroposGRPOTrainer. Replaced by `atropos_group_size`. "
+            "The Atropos environment controls the number of generations per prompt."
+        },
+    )
+    max_completion_length: int | None = field(
+        default=None,
+        metadata={
+            "help": "IGNORED in AsyncAtroposGRPOTrainer. Replaced by `atropos_max_tokens`. "
+            "The Atropos environment controls the max completion length."
+        },
+    )
+    temperature: float | None = field(
+        default=None,
+        metadata={
+            "help": "IGNORED in AsyncAtroposGRPOTrainer. Controlled by the Atropos environment. "
+            "The Atropos environment sets the sampling temperature."
+        },
+    )
+    chat_template_kwargs: dict | None = field(
+        default=None,
+        metadata={
+            "help": "IGNORED in AsyncAtroposGRPOTrainer. Atropos handles chat templating. "
+            "The Atropos environment applies the chat template."
+        },
+    )
+    max_tool_calling_iterations: int | None = field(
+        default=None,
+        metadata={
+            "help": "IGNORED in AsyncAtroposGRPOTrainer. Atropos environment handles tool use. "
+            "The Atropos environment controls max tool-calling iterations."
+        },
+    )
+    max_inflight_tasks: int | None = field(
+        default=None,
+        metadata={
+            "help": "IGNORED in AsyncAtroposGRPOTrainer. Atropos polls batches, doesn't manage inflight tasks. "
+            "This parameter is only used by the vLLM-based AsyncRolloutWorker."
+        },
+    )
+    request_timeout: int | None = field(
+        default=None,
+        metadata={
+            "help": "IGNORED in AsyncAtroposGRPOTrainer. Only used for vLLM /v1/completions calls. "
+            "AtroposRolloutWorker uses its own `atropos_batch_timeout` and `atropos_poll_interval`."
+        },
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Warn if user explicitly sets ignored parameters
+        ignored_params = {
+            "num_generations": "atropos_group_size",
+            "max_completion_length": "atropos_max_tokens",
+            "temperature": "Atropos environment temperature setting",
+            "chat_template_kwargs": "Atropos environment chat templating",
+            "max_tool_calling_iterations": "Atropos environment tool use handling",
+            "max_inflight_tasks": "Atropos batch polling (not used)",
+            "request_timeout": "atropos_batch_timeout / atropos_poll_interval",
+        }
+
+        for param, replacement in ignored_params.items():
+            value = getattr(self, param)
+            if value is not None:
+                warnings.warn(
+                    f"Parameter '{param}' is ignored in AsyncAtroposGRPOTrainer. "
+                    f"It is replaced by {replacement}. "
+                    f"Value provided ({value}) will have no effect.",
+                    UserWarning,
+                    stacklevel=2,
+                )

@@ -52,6 +52,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from typing import Any, Dict, Optional, Union
+import os
 
 from datasets import Dataset
 import torch
@@ -124,7 +125,11 @@ class AsyncAtroposGRPOTrainer(AsyncGRPOTrainer):
             args = AsyncAtroposGRPOConfig(
                 output_dir=f"{model_name.split('/')[-1]}-async-atropos-grpo",
             )
-
+            
+        #Set the Wandb project here so that the WandB callback picks it up   
+        #Must be set before super.init() is called 
+        os.environ["WANDB_PROJECT"] = args.atropos_env_wandb_project
+        
         if not isinstance(args, AsyncAtroposGRPOConfig):
             raise TypeError(
                 f"AsyncAtroposGRPOTrainer requires an AsyncAtroposGRPOConfig instance, "
