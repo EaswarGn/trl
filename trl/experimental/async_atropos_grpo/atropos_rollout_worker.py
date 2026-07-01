@@ -59,7 +59,7 @@ import numpy as np
 import requests
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from trl.experimental.async_grpo.async_rollout_worker import RolloutSample
+from trl.experimental.async_grpo.async_rollout_worker import AsyncRolloutWorker, RolloutSample
 from trl.trainer.utils import print_prompt_completions_sample
 
 logger = logging.getLogger(__name__)
@@ -309,6 +309,7 @@ class _AtroposPollingLoop:
         samples: list[RolloutSample],
         conversion_time_s: float,
         buffer_wait_time_s: float,
+        buffer_qsize_before_push: int | None = None,
     ) -> None:
         """Attach extra per-sample metrics to every ``RolloutSample`` in-place.
 
@@ -320,12 +321,20 @@ class _AtroposPollingLoop:
               mp.Queue when it was full.
             - ``generation_tok_per_s``: rolling throughput since this child
               process started.
-            - ``buffer_qsize``: number of items in rollout buffer.
+            - ``buffer_qsize``: number of items in the rollout buffer *before*
+              the current batch was pushed.  Capturing qsize before the push
+              (rather than after) ensures the metric reflects the actual backlog
+              the trainer still needs to consume, rather than always being at
+              least ``len(samples)``.
         """
         assert self._generation_start_time is not None
         elapsed = time.monotonic() - self._generation_start_time
         generation_tok_per_sec = self._total_completion_tokens / elapsed if elapsed > 0 else 0.0
-        buffer_qsize = self.rollout_buffer.qsize()
+        if buffer_qsize_before_push is not None:
+            buffer_qsize = buffer_qsize_before_push
+        else:
+            # Fallback for callers that don't pass the pre-push qsize
+            buffer_qsize = self.rollout_buffer.qsize()
 
         for sample in samples:
             sample.metrics["conversion_time_ms"] = conversion_time_s * 1000
@@ -586,6 +595,15 @@ class _AtroposPollingLoop:
                 for s in samples:
                     self._total_completion_tokens += sum(s.completion_mask)
 
+                # Capture the queue size *before* pushing new samples, so that
+                # buffer_qsize reflects how many samples were already waiting
+                # (i.e. the backlog from previous batches the trainer hasn't
+                # consumed yet).  The original AsyncRolloutWorker captures qsize
+                # before pushing, which produces a meaningful metric; doing it
+                # after the push would always show at least len(samples) items,
+                # yielding a flat line at the batch size in wandb.
+                buffer_qsize_before_push = self.rollout_buffer.qsize()
+
                 # Push each sample onto the shared queue, tracking queue-wait time
                 t_buffer_start = time.monotonic()
                 buffer_wait_time_s = 0.0
@@ -605,7 +623,7 @@ class _AtroposPollingLoop:
                 buffer_wait_time_s = time.monotonic() - t_buffer_start
 
                 # Attach rollout metrics to each sample before the trainer consumes them
-                self._compute_rollout_metrics(samples, conversion_time_s, buffer_wait_time_s)
+                self._compute_rollout_metrics(samples, conversion_time_s, buffer_wait_time_s, buffer_qsize_before_push=buffer_qsize_before_push)
 
                 # Optionally print a human-readable prompt/completion sample
                 if self.log_completions and samples:
@@ -670,15 +688,15 @@ class _AtroposPollingLoop:
 # ---------------------------------------------------------------------------
 
 
-class AtroposRolloutWorker:
+class AtroposRolloutWorker(AsyncRolloutWorker):
     """Parent-side controller for the Atropos polling child process.
 
-    Implements ``RolloutWorkerProtocol`` so it can be passed as
-    ``rollout_worker`` to ``AsyncGRPOTrainer``.
+    Subclasses ``AsyncRolloutWorker`` and overrides ``__init__`` and ``start()``
+    to use the Atropos-specific child process (``_AtroposPollingLoop``) instead
+    of the async vLLM-based child process.
 
-    The child process runs ``_AtroposPollingLoop`` which polls the Atropos API
-    for scored trajectory batches and pushes them onto the shared
-    ``mp.Queue`` (``rollout_buffer``).
+    The child process polls the Atropos API for pre-scored trajectory batches
+    and pushes them onto the shared ``mp.Queue`` (``rollout_buffer``).
 
     Pickling note
     -------------
@@ -698,19 +716,20 @@ class AtroposRolloutWorker:
         queue_maxsize: int = 0,
         child_ready_timeout: int = 300,
         log_completions: bool = False,
-        num_completions_to_print: int = 3,
+        num_completions_to_print: int | None = None,
         processing_class_name: str | None = None,
     ):
-        ctx = mp.get_context("spawn")
-        self._mp_ctx = ctx
-        self.rollout_buffer = ctx.Queue(maxsize=queue_maxsize)
-        self._model_version_value = ctx.Value("i", 0)
-        self._stop_event_mp = ctx.Event()
-        self._child_ready_event = ctx.Event()
-        self._heartbeat_value = ctx.Value("d", 0.0)
-        self._failed_event = ctx.Event()
-        self._exception_info_queue = ctx.Queue(maxsize=1)
+        # Call super().__init__() to set up shared multiprocessing primitives
+        # (rollout_buffer, _model_version_value, _stop_event_mp, etc.).
+        super().__init__(
+            queue_maxsize=queue_maxsize,
+            child_ready_timeout=child_ready_timeout,
+        )
 
+        # Override the parent's _loop_kwargs with our Atropos-specific kwargs.
+        # The parent stores extra keyword arguments in self._loop_kwargs, but
+        # we use self._worker_kwargs instead (the Atropos child process reads
+        # from _worker_kwargs, not _loop_kwargs).
         self._worker_kwargs = {
             "atropos_api_url": atropos_api_url,
             "group_size": group_size,
@@ -721,28 +740,17 @@ class AtroposRolloutWorker:
             "num_completions_to_print": num_completions_to_print,
             "processing_class_name": processing_class_name,
         }
-        self._child_ready_timeout = child_ready_timeout
-        self._process: mp.Process | None = None
-
-    @property
-    def model_version(self) -> int:
-        return int(self._model_version_value.value)
-
-    @model_version.setter
-    def model_version(self, value: int) -> None:
-        with self._model_version_value.get_lock():
-            self._model_version_value.value = int(value)
 
     # ------------------------------------------------------------------
-    # RolloutWorkerProtocol implementation
+    # RolloutWorkerProtocol implementation (overrides)
     # ------------------------------------------------------------------
-
-    def update_model_version(self, model_version: int) -> None:
-        """Tell the child process the current policy version for staleness tracking."""
-        self.model_version = model_version
 
     def start(self) -> None:
-        """Spawn the child process and wait for it to signal readiness."""
+        """Spawn the child process and wait for it to signal readiness.
+
+        Overrides ``AsyncRolloutWorker.start()`` to use the Atropos-specific
+        ``_child_main`` entry point and ``_worker_kwargs``.
+        """
         if self._process is not None:
             logger.warning(
                 "AtroposRolloutWorker.start() called but child is already running; ignoring."
@@ -800,7 +808,11 @@ class AtroposRolloutWorker:
         logger.info("AtroposRolloutWorker child is ready")
 
     def check_health(self, stale_after_s: float) -> None:
-        """Raise if the child crashed or hasn't ticked the heartbeat within ``stale_after_s``."""
+        """Raise if the child crashed or hasn't ticked the heartbeat within ``stale_after_s``.
+
+        Overrides ``AsyncRolloutWorker.check_health()`` with Atropos-specific
+        error messages.
+        """
         if self._failed_event.is_set():
             try:
                 type_name, msg, tb = self._exception_info_queue.get_nowait()
@@ -814,19 +826,3 @@ class AtroposRolloutWorker:
                 f"Atropos rollout worker heartbeat stale: {age:.0f}s > {stale_after_s:.0f}s; "
                 "child is hung."
             )
-
-    def stop(self) -> None:
-        """Stop the child process and release its resources."""
-        if self._process is None:
-            return
-        logger.info("Stopping AtroposRolloutWorker child process...")
-        self._stop_event_mp.set()
-        if self._process._popen is not None:
-            self._process.join(timeout=15)
-            if self._process.is_alive():
-                logger.warning("Child did not exit within 15s; terminating.")
-                self._process.terminate()
-                self._process.join(timeout=5)
-                if self._process.is_alive():
-                    self._process.kill()
-        self._process = None
