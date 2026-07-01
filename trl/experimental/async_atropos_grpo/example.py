@@ -54,14 +54,14 @@ def main():
         atropos_poll_interval=1.0,
         atropos_max_retries=3,
         atropos_max_tokens=4096,
+        atropos_env_wandb_group="atropos-gsm8k",
+        atropos_env_wandb_project="trl-atropos-integration",
         # --- vLLM server (vanilla vLLM with VLLM_SERVER_DEV_MODE=1) ---
         vllm_server_base_url="http://localhost:9001",
         vllm_server_timeout=240.0,
         weight_sync_steps=1,
         # --- Training hyperparameters ---
         per_device_train_batch_size=8,
-        num_generations=8,
-        temperature=1.0,
         epsilon=0.2,
         epsilon_high=0.28,
         max_steps=100,         # total optimizer steps
@@ -72,7 +72,6 @@ def main():
         bf16=True,
         gradient_checkpointing=True,
         # --- Async rollout pipeline ---
-        #max_inflight_tasks=-1,  # auto-compute
         max_staleness=4,
         queue_maxsize=1024,
         heartbeat_stale_after_s=300.0,
