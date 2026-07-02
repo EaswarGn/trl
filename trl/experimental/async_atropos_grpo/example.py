@@ -39,8 +39,7 @@ from trl.experimental.async_atropos_grpo import (
     AsyncAtroposGRPOTrainer,
     AsyncAtroposGRPOConfig,
 )
-import datetime
-
+from datetime import datetime
 
 def main():
     
