@@ -309,7 +309,7 @@ class _AtroposPollingLoop:
         samples: list[RolloutSample],
         conversion_time_s: float,
         buffer_wait_time_s: float,
-        buffer_qsize_before_push: int | None = None,
+        buffer_qsize: int | None = None,
     ) -> None:
         """Attach extra per-sample metrics to every ``RolloutSample`` in-place.
 
@@ -321,20 +321,11 @@ class _AtroposPollingLoop:
               mp.Queue when it was full.
             - ``generation_tok_per_s``: rolling throughput since this child
               process started.
-            - ``buffer_qsize``: number of items in the rollout buffer *before*
-              the current batch was pushed.  Capturing qsize before the push
-              (rather than after) ensures the metric reflects the actual backlog
-              the trainer still needs to consume, rather than always being at
-              least ``len(samples)``.
+            - ``buffer_qsize``: number of items in the rollout buffer.
         """
         assert self._generation_start_time is not None
         elapsed = time.monotonic() - self._generation_start_time
         generation_tok_per_sec = self._total_completion_tokens / elapsed if elapsed > 0 else 0.0
-        if buffer_qsize_before_push is not None:
-            buffer_qsize = buffer_qsize_before_push
-        else:
-            # Fallback for callers that don't pass the pre-push qsize
-            buffer_qsize = self.rollout_buffer.qsize()
 
         for sample in samples:
             sample.metrics["conversion_time_ms"] = conversion_time_s * 1000
@@ -595,15 +586,6 @@ class _AtroposPollingLoop:
                 for s in samples:
                     self._total_completion_tokens += sum(s.completion_mask)
 
-                # Capture the queue size *before* pushing new samples, so that
-                # buffer_qsize reflects how many samples were already waiting
-                # (i.e. the backlog from previous batches the trainer hasn't
-                # consumed yet).  The original AsyncRolloutWorker captures qsize
-                # before pushing, which produces a meaningful metric; doing it
-                # after the push would always show at least len(samples) items,
-                # yielding a flat line at the batch size in wandb.
-                buffer_qsize_before_push = self.rollout_buffer.qsize()
-
                 # Push each sample onto the shared queue, tracking queue-wait time
                 t_buffer_start = time.monotonic()
                 buffer_wait_time_s = 0.0
@@ -623,7 +605,7 @@ class _AtroposPollingLoop:
                 buffer_wait_time_s = time.monotonic() - t_buffer_start
 
                 # Attach rollout metrics to each sample before the trainer consumes them
-                self._compute_rollout_metrics(samples, conversion_time_s, buffer_wait_time_s, buffer_qsize_before_push=buffer_qsize_before_push)
+                self._compute_rollout_metrics(samples, conversion_time_s, buffer_wait_time_s, buffer_qsize=self.rollout_buffer.qsize())
 
                 # Optionally print a human-readable prompt/completion sample
                 if self.log_completions and samples:
