@@ -128,7 +128,16 @@ class AsyncAtroposGRPOTrainer(AsyncGRPOTrainer):
             
         #Set the Wandb project here so that the WandB callback picks it up   
         #Must be set before super.init() is called 
-        os.environ["WANDB_PROJECT"] = args.atropos_env_wandb_project
+        if args.wandb_project_name:
+            os.environ["WANDB_PROJECT"] = args.wandb_project_name
+            
+        if args.wandb_run_name:
+            logger.warning(f"""
+                Overriding 'run_name' config ({args.run_name}) with 'wandb_run_name config ({args.wandb_run_name})
+                Unset 'wandb_run_name' if this is unintended behavior.
+            """)
+            args.run_name = args.wandb_run_name
+            
         
         if not isinstance(args, AsyncAtroposGRPOConfig):
             raise TypeError(
@@ -207,8 +216,8 @@ class AsyncAtroposGRPOTrainer(AsyncGRPOTrainer):
         url = f"{self.atropos_configs.atropos_api_url}/register"
         payload = {
             # wandb fields are required strings - use empty string if None
-            "wandb_group": self.atropos_configs.atropos_env_wandb_group or "",
-            "wandb_project": self.atropos_configs.atropos_env_wandb_project or "",
+            "wandb_group": self.atropos_configs.atropos_wandb_group_name or "",
+            "wandb_project": self.atropos_configs.wandb_project_name or "",
             "batch_size": self.atropos_configs.per_device_train_batch_size,
             "max_token_len": self.atropos_configs.atropos_max_tokens,
             "starting_step": self.state.global_step,
