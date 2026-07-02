@@ -42,10 +42,14 @@ class AsyncAtroposGRPOConfig(AsyncGRPOConfig):
     atropos_max_retries (`int`, *optional*, defaults to `3`):
         Number of HTTP retries on transient failures when polling the
         Atropos API.
-    atropos_env_wandb_project (`str` or `None`, *optional*, defaults to `None`):
-        Name of wandb project to use for atropos env metrics, if enabled in env.
-    atropos_env_wandb_group (`str` or `None`, *optional*, defaults to `None`):
-        Name of wandb group to use for atropos env metrics.
+    wandb_project_name (`str` or `None`, *optional*, defaults to `None`):
+        Name of wandb project to use for trainer and atropos env metrics.
+    atropos_wandb_group_name (`str` or `None`, *optional*, defaults to `None`):
+        Name of wandb group to use for atropos env metrics. (Doesn't apply to trainer)
+    wandb_run_name (`str` or `None`, *optional*, defaults to `None`):
+        Name of wandb run to use for trainer metrics.
+        wandb run name for atropos env is set separately during env instantiation.
+        Overrides the `run_name` config set by the TrainingArguments. 
     atropos_max_tokens (`int`, *optional*, defaults to `2048`):
         Maximum number of tokens to use for prompt and completion.
         This value should be equal to the max prompt+completion tokens you expect.
@@ -58,7 +62,6 @@ class AsyncAtroposGRPOConfig(AsyncGRPOConfig):
 
     - `num_generations`: Replaced by `atropos_group_size`
     - `max_completion_length`: Replaced by `atropos_max_tokens`
-    - `temperature`: Controlled by the Atropos environment
     - `chat_template_kwargs`: Atropos handles chat templating
     - `max_tool_calling_iterations`: Atropos environment handles tool use
     - `max_inflight_tasks`: Atropos polls batches, doesn't manage inflight tasks
@@ -93,16 +96,24 @@ class AsyncAtroposGRPOConfig(AsyncGRPOConfig):
         default=3,
         metadata={"help": "Number of HTTP retries on transient failures."},
     )
-    atropos_env_wandb_project: str | None = field(
+    wandb_project_name: str | None = field(
         default=None,
         metadata={
-            "help": "Name of wandb project to use for atropos env metrics, if enabled in env."
+            "help": "Name of wandb project to use for trainer and atropos env metrics."
         },
     )
-    atropos_env_wandb_group: str | None = field(
+    atropos_wandb_group_name: str | None = field(
         default=None,
         metadata={
-            "help": "Name of wandb group to use for atropos env metrics."
+            "help": "Name of wandb group to use for atropos env metrics. (Doesn't apply to trainer)"
+        },
+    )
+    wandb_run_name: str | None = field(
+        default=None,
+        metadata={
+            "help": "Name of wandb run to use for trainer metrics. "
+            "wandb run name for atropos env is set separately during env instantiation."
+            "Overrides the `run_name` config set by the TrainingArguments. "
         },
     )
     atropos_max_tokens: int = field(
@@ -130,13 +141,6 @@ class AsyncAtroposGRPOConfig(AsyncGRPOConfig):
             "The Atropos environment controls the max completion length."
         },
     )
-    temperature: float | None = field(
-        default=None,
-        metadata={
-            "help": "IGNORED in AsyncAtroposGRPOTrainer. Controlled by the Atropos environment. "
-            "The Atropos environment sets the sampling temperature."
-        },
-    )
     chat_template_kwargs: dict | None = field(
         default=None,
         metadata={
@@ -151,8 +155,8 @@ class AsyncAtroposGRPOConfig(AsyncGRPOConfig):
             "The Atropos environment controls max tool-calling iterations."
         },
     )
-    max_inflight_tasks: int | None = field(
-        default=None,
+    max_inflight_tasks: int = field(
+        default=0,
         metadata={
             "help": "IGNORED in AsyncAtroposGRPOTrainer. Atropos polls batches, doesn't manage inflight tasks. "
             "This parameter is only used by the vLLM-based AsyncRolloutWorker."
@@ -168,12 +172,18 @@ class AsyncAtroposGRPOConfig(AsyncGRPOConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        
+        warnings.warn(
+            f"Make sure temperature you passed to training config (temperature={getattr(self , self.temperature)})"
+            f"is equal to the temerpature you passed to atropos env during startup",
+            UserWarning,
+            stacklevel=2,
+        )
 
         # Warn if user explicitly sets ignored parameters
         ignored_params = {
             "num_generations": "atropos_group_size",
             "max_completion_length": "atropos_max_tokens",
-            "temperature": "Atropos environment temperature setting",
             "chat_template_kwargs": "Atropos environment chat templating",
             "max_tool_calling_iterations": "Atropos environment tool use handling",
             "max_inflight_tasks": "Atropos batch polling (not used)",
