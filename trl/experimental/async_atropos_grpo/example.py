@@ -58,7 +58,7 @@ def main():
         atropos_poll_interval=1.0,
         atropos_max_retries=3,
         atropos_max_tokens=4096,
-        atropos_wandb_group="atropos-gsm8k",
+        atropos_wandb_group_name="atropos-gsm8k",
         wandb_project_name="trl-atropos-integration",
         wandb_run_name=run_name,
         # --- vLLM server (vanilla vLLM with VLLM_SERVER_DEV_MODE=1) ---
