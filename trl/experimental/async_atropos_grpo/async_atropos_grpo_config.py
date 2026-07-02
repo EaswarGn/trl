@@ -174,7 +174,7 @@ class AsyncAtroposGRPOConfig(AsyncGRPOConfig):
         super().__post_init__()
         
         warnings.warn(
-            f"Make sure temperature you passed to training config (temperature={getattr(self , self.temperature)})"
+            f"Make sure temperature you passed to training config (temperature={getattr(self , "temperature")})"
             f"is equal to the temerpature you passed to atropos env during startup",
             UserWarning,
             stacklevel=2,
