@@ -44,21 +44,21 @@ from datetime import datetime
 def main():
     
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_name = f"trl-gsm8k-{timestamp}"
+    run_name = f"trl-math_server_zero-{timestamp}"
     
     # ------------------------------------------------------------------
     # Configuration
     # ------------------------------------------------------------------
     config = AsyncAtroposGRPOConfig(
-        output_dir="./async_atropos_grpo_output",
+        output_dir="./math_server_zero_output",
         # --- Atropos API settings ---
         atropos_api_url="http://localhost:8000",
-        atropos_group_size=8,
+        atropos_group_size=16,
         atropos_batch_timeout=300.0,
         atropos_poll_interval=1.0,
         atropos_max_retries=3,
-        atropos_max_tokens=4096,
-        atropos_wandb_group_name="atropos-gsm8k",
+        atropos_max_tokens=6144,
+        atropos_wandb_group_name="atropos-math_server_zero",
         wandb_project_name="trl-atropos-integration",
         wandb_run_name=run_name,
         # --- vLLM server (vanilla vLLM with VLLM_SERVER_DEV_MODE=1) ---
@@ -66,7 +66,7 @@ def main():
         vllm_server_timeout=240.0,
         weight_sync_steps=1,
         # --- Training hyperparameters ---
-        per_device_train_batch_size=8,
+        per_device_train_batch_size=16,
         temperature=1.0,
         epsilon=0.2,
         epsilon_high=0.28,
